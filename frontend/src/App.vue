@@ -6,6 +6,7 @@
       <router-link class="nav-link" to="/detections">检测项配置</router-link>
       <router-link class="nav-link" to="/people">人员名单</router-link>
       <router-link class="nav-link" to="/tools">工器具</router-link>
+      <router-link class="nav-link" to="/alarm-settings">报警设置</router-link>
       <router-link class="nav-link" to="/alarms">报警记录</router-link>
     </aside>
     <section class="main">

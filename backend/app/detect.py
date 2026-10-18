@@ -16,11 +16,8 @@ HELMET_URL = "https://huggingface.co/keremberke/yolov8n-hard-hat-detection/resol
 FACE_DET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 FACE_REC_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 FACE_THRESHOLD = 0.363
-ALARM_GAP_SECONDS = 20
 PRESENCE_SECONDS = 15
 TRACKED_CODES = {1, 2, 3, 4, 5}
-PHONE_HOLD_SECONDS = 1.0
-PHONE_GRACE_SECONDS = 2.5
 POSE_POINT_CONF = 0.4
 
 _lock = threading.Lock()
@@ -31,6 +28,7 @@ _boxes: list[dict] = []
 _busy = False
 _last_run = 0.0
 _last_alarm: dict[tuple, float] = {}
+_alarm_hits: dict[tuple, list[float]] = {}
 _last_frame = None
 _person_model = None
 _helmet_model = None
@@ -57,8 +55,6 @@ _dwell_since: dict[int, float] = {}
 _dwell_seen: dict[int, float] = {}
 _dwell_latched: set[int] = set()
 _timer_stage = ""
-_phone_since: float | None = None
-_phone_seen = 0.0
 DWELL_GRACE_SECONDS = 3
 
 
@@ -126,11 +122,8 @@ def _clear_dwell_locked() -> None:
 
 
 def reset_tracking() -> None:
-    global _phone_since, _phone_seen
     with _state_lock:
         _clear_dwell_locked()
-        _phone_since = None
-        _phone_seen = 0.0
 
 
 def invalidate_zone_cache() -> None:
@@ -706,16 +699,7 @@ def _wrist_at_ear(points, scores) -> bool:
 
 
 def _check_phone(calling: list[dict], linked: list, image) -> None:
-    global _phone_since, _phone_seen
-    now = time.time()
-    with _state_lock:
-        if not calling:
-            return
-        if _phone_since is None or now - _phone_seen > PHONE_GRACE_SECONDS:
-            _phone_since = now
-        _phone_seen = now
-        ready = now - _phone_since >= PHONE_HOLD_SECONDS
-    if not ready:
+    if not calling:
         return
     identity = _identity_for_pose(calling[0], linked)
     name = identity["name"] if identity and identity.get("name") else "现场"
@@ -894,10 +878,20 @@ def _embed_file(path: str):
 def _raise_alarm(code: int, title: str, detail: str, person: str, image=None) -> None:
     key = (code, person)
     now = time.time()
+    window = max(1, _setting_int("alarm_window_seconds", 3))
+    need = max(1, _setting_int("alarm_count", 3))
+    gap = max(1, _setting_int("alarm_gap_seconds", 20))
     with _alarm_lock:
-        if now - _last_alarm.get(key, 0) < ALARM_GAP_SECONDS:
+        stamps = [stamp for stamp in _alarm_hits.get(key, []) if now - stamp <= window]
+        stamps.append(now)
+        if len(stamps) < need:
+            _alarm_hits[key] = stamps
+            return
+        if now - _last_alarm.get(key, 0) < gap:
+            _alarm_hits[key] = stamps
             return
         _last_alarm[key] = now
+        _alarm_hits[key] = []
     alarm_id = execute(
         """
         INSERT INTO alarms (code, title, detail, person, stage, simulated)

@@ -119,6 +119,15 @@ def init_db() -> None:
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES ('ack_backfill', '0')"
             )
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES ('alarm_window_seconds', '3')"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES ('alarm_count', '3')"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES ('alarm_gap_seconds', '20')"
+            )
             columns = [row[1] for row in conn.execute("PRAGMA table_info(stage_cameras)")]
             if "source_type" not in columns:
                 conn.execute(

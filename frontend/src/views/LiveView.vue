@@ -70,7 +70,7 @@
             </section>
             <section v-if="codeOn(4)" class="ops">
               <h2>危险动作</h2>
-              <p class="hint">面向摄像头，把手机贴到耳侧约 1 秒。举手过头不会报警。</p>
+              <p class="hint">面向摄像头，把手机贴在耳侧。举手过头不会报警。是否报警按「报警设置」里的累计次数和时间。</p>
             </section>
             <section v-if="codeOn(5)" class="ops">
               <h2>二维码工器具</h2>
