@@ -279,5 +279,7 @@ th { color: var(--muted); font-weight: 600; }
 }
 .modal { width: min(520px, calc(100vw - 32px)); background: #1b2430; border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; font-size: 13px; color: var(--muted); }
+.settings-form { max-width: 360px; }
+.settings-form .btn { margin-top: 6px; }
 .error { color: var(--danger); font-size: 13px; margin: 8px 0; }
 .filter { margin-bottom: 12px; }

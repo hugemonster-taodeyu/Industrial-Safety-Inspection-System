@@ -58,6 +58,9 @@ class SettingsBody(BaseModel):
     leave_seconds: int | None = Field(default=None, ge=5, le=600)
     dwell_minutes: int | None = Field(default=None, ge=1, le=180)
     test_running: bool | None = None
+    alarm_window_seconds: int | None = Field(default=None, ge=1, le=120)
+    alarm_count: int | None = Field(default=None, ge=1, le=20)
+    alarm_gap_seconds: int | None = Field(default=None, ge=1, le=600)
 
 
 class ZoneBody(BaseModel):
@@ -124,6 +127,13 @@ def _setting_value(key: str, default: str) -> str:
     return row["value"] if row else default
 
 
+def _setting_int_value(key: str, default: int) -> int:
+    try:
+        return int(_setting_value(key, str(default)))
+    except ValueError:
+        return default
+
+
 def _put_setting(key: str, value: str) -> None:
     execute(
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -174,6 +184,9 @@ def get_settings():
         "leave_seconds": leave_seconds,
         "dwell_minutes": dwell_minutes,
         "test_running": _setting_value("test_running", "0") == "1",
+        "alarm_window_seconds": _setting_int_value("alarm_window_seconds", 3),
+        "alarm_count": _setting_int_value("alarm_count", 3),
+        "alarm_gap_seconds": _setting_int_value("alarm_gap_seconds", 20),
     }
 
 
@@ -195,6 +208,12 @@ def update_settings(body: SettingsBody):
     if body.test_running is not None:
         _put_setting("test_running", "1" if body.test_running else "0")
         reset_tracking()
+    if body.alarm_window_seconds is not None:
+        _put_setting("alarm_window_seconds", str(body.alarm_window_seconds))
+    if body.alarm_count is not None:
+        _put_setting("alarm_count", str(body.alarm_count))
+    if body.alarm_gap_seconds is not None:
+        _put_setting("alarm_gap_seconds", str(body.alarm_gap_seconds))
     return get_settings()
 
 

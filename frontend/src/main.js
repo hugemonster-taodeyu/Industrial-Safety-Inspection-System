@@ -6,6 +6,7 @@ import DetectionsView from "./views/DetectionsView.vue";
 import PeopleView from "./views/PeopleView.vue";
 import ToolsView from "./views/ToolsView.vue";
 import AlarmsView from "./views/AlarmsView.vue";
+import AlarmSettingsView from "./views/AlarmSettingsView.vue";
 import "./styles.css";
 
 const router = createRouter({
@@ -15,6 +16,7 @@ const router = createRouter({
     { path: "/detections", component: DetectionsView },
     { path: "/people", component: PeopleView },
     { path: "/tools", component: ToolsView },
+    { path: "/alarm-settings", component: AlarmSettingsView },
     { path: "/alarms", component: AlarmsView },
   ],
 });
