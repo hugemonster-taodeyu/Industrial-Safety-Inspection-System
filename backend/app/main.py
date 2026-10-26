@@ -2,6 +2,8 @@ import json
 from datetime import date
 from pathlib import Path
 
+import numpy as np
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -19,6 +21,7 @@ from .camera import (
 )
 from .database import PHOTO_DIR, SNAPSHOT_DIR, execute, init_db, query_all, query_one
 from .detect import invalidate_zone_cache, presence_status, reset_tracking, start_presence
+from .process import analyze_process_frame, start_process, stop_process
 from .seed import DETECTION_CODES, seed_detections, seed_environments
 
 app = FastAPI(title="工程行为安全检测系统")
@@ -872,6 +875,33 @@ def stream():
         mjpeg_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.post("/api/process/start")
+def begin_process():
+    try:
+        return start_process()
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/process/stop")
+def end_process():
+    return stop_process()
+
+
+@app.post("/api/process/frame")
+async def process_frame(file: UploadFile = File(...)):
+    import cv2
+
+    data = await file.read()
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(400, "无法读取画面")
+    try:
+        return analyze_process_frame(image)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 if FRONTEND_DIST.exists():
