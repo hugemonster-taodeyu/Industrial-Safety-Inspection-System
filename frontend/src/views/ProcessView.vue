@@ -1,12 +1,12 @@
 <template>
   <div>
     <h1 class="page-title">流程检测</h1>
-    <div class="note">选择本地视频后点击「开始」。每一帧检测完才显示这一帧和它的框，然后再检测下一帧。四个步骤按顺序进行。</div>
+    <div class="note">选择本地视频后点击「开始」。每 25 帧检测一次，检测完才显示这一帧和它的框，然后再跳到后面的帧。</div>
     <p v-if="error" class="error">{{ error }}</p>
     <div class="live">
       <div>
         <div class="process-stage">
-          <video v-if="videoUrl" ref="videoEl" :class="{ 'hidden-decoder': stillUrl }" :src="videoUrl" controls></video>
+          <video v-if="videoUrl" ref="videoEl" :class="{ 'hidden-decoder': stillUrl }" :src="videoUrl" controls @loadedmetadata="onMeta"></video>
           <img v-if="stillUrl" class="process-frame" :src="stillUrl" alt="" />
           <svg v-if="stillUrl && boxes.length" class="process-overlay" viewBox="0 0 1 1" preserveAspectRatio="none">
             <rect
@@ -23,6 +23,21 @@
               <p>还没有选择视频</p>
             </div>
           </div>
+        </div>
+        <div class="camera-bar">
+          <span class="time">{{ clock(time) }}</span>
+          <input
+            class="progress"
+            type="range"
+            min="0"
+            max="1000"
+            :value="slider"
+            :disabled="!videoUrl"
+            @pointerdown="scrubbing = true"
+            @input="onSliderInput"
+            @change="onSliderChange"
+          />
+          <span class="time">{{ clock(duration) }}</span>
         </div>
         <div class="camera-bar">
           <span class="chip">{{ fileName || "未选择视频" }}</span>
@@ -79,7 +94,12 @@ const videoEl = ref(null);
 const stillUrl = ref("");
 const running = ref(false);
 const error = ref("");
+const time = ref(0);
+const duration = ref(0);
+const slider = ref(0);
 let stillObjectUrl = "";
+let scrubbing = false;
+let pendingSeek = null;
 
 function blankSteps() {
   return [
@@ -88,6 +108,39 @@ function blankSteps() {
     { name: "接线", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
     { name: "放电", passed: false },
   ];
+}
+
+function clock(seconds) {
+  const value = Math.max(0, Math.floor(seconds || 0));
+  const minutes = Math.floor(value / 60);
+  const remain = value % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remain).padStart(2, "0")}`;
+}
+
+function onMeta() {
+  const video = videoEl.value;
+  if (!video) return;
+  duration.value = video.duration || 0;
+}
+
+function onSliderInput(event) {
+  scrubbing = true;
+  slider.value = Number(event.target.value);
+  if (duration.value) time.value = (slider.value / 1000) * duration.value;
+}
+
+function onSliderChange(event) {
+  const video = videoEl.value;
+  scrubbing = false;
+  slider.value = Number(event.target.value);
+  if (!video?.duration) return;
+  const target = (slider.value / 1000) * video.duration;
+  time.value = target;
+  if (running.value) {
+    pendingSeek = target;
+    return;
+  }
+  video.currentTime = target;
 }
 
 function stateText(step, index) {
@@ -127,6 +180,10 @@ function onFile(event) {
   steps.value = blankSteps();
   current.value = 0;
   boxes.value = [];
+  time.value = 0;
+  duration.value = 0;
+  slider.value = 0;
+  pendingSeek = null;
   error.value = "";
 }
 
@@ -138,6 +195,10 @@ function clearVideo() {
   fileName.value = "";
   steps.value = blankSteps();
   boxes.value = [];
+  time.value = 0;
+  duration.value = 0;
+  slider.value = 0;
+  pendingSeek = null;
 }
 
 function seek(video, time) {
@@ -185,12 +246,19 @@ async function start() {
 async function runFrames() {
   const video = videoEl.value;
   while (running.value && video) {
+    if (pendingSeek != null) {
+      const target = pendingSeek;
+      pendingSeek = null;
+      await seek(video, Math.min(Math.max(target, 0), Math.max(video.duration - 0.001, 0)));
+    }
+    if (!running.value) break;
     if (video.currentTime >= video.duration - 0.001) {
       stopLoop();
       break;
     }
     const blob = await capture(video);
     if (!blob || !running.value) break;
+    if (pendingSeek != null) continue;
     let status;
     try {
       status = await api.processFrame(blob);
@@ -199,11 +267,15 @@ async function runFrames() {
       stopLoop();
       break;
     }
-    if (!running.value) break;
+    if (!running.value || pendingSeek != null) continue;
     showStill(blob);
     applyStatus(status);
-    if (!running.value) break;
-    const next = Math.min(video.duration, video.currentTime + 1 / 25);
+    if (!scrubbing && video.duration) {
+      time.value = video.currentTime;
+      slider.value = Math.round((video.currentTime / video.duration) * 1000);
+    }
+    if (!running.value || pendingSeek != null) continue;
+    const next = Math.min(video.duration, video.currentTime + 25 / 25);
     if (next >= video.duration - 0.001) {
       stopLoop();
       break;
