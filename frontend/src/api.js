@@ -37,6 +37,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     }),
+  startProcess: () => request("/api/process/start", { method: "POST" }),
+  processFrame: (blob) => {
+    const body = new FormData();
+    body.append("file", blob, "frame.jpg");
+    return request("/api/process/frame", { method: "POST", body });
+  },
   detections: () => request("/api/detections"),
   toggleDetection: (code, enabled) =>
     request(`/api/detections/${code}`, {

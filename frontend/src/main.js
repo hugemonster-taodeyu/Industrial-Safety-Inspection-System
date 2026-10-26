@@ -7,12 +7,14 @@ import PeopleView from "./views/PeopleView.vue";
 import ToolsView from "./views/ToolsView.vue";
 import AlarmsView from "./views/AlarmsView.vue";
 import AlarmSettingsView from "./views/AlarmSettingsView.vue";
+import ProcessView from "./views/ProcessView.vue";
 import "./styles.css";
 
 const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: "/", component: LiveView },
+    { path: "/process", component: ProcessView },
     { path: "/detections", component: DetectionsView },
     { path: "/people", component: PeopleView },
     { path: "/tools", component: ToolsView },

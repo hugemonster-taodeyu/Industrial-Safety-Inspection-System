@@ -3,6 +3,7 @@
     <aside class="side">
       <div class="brand">工程行为安全检测系统</div>
       <router-link class="nav-link" to="/">实时监控</router-link>
+      <router-link class="nav-link" to="/process">流程检测</router-link>
       <router-link class="nav-link" to="/detections">检测项配置</router-link>
       <router-link class="nav-link" to="/people">人员名单</router-link>
       <router-link class="nav-link" to="/tools">工器具</router-link>
