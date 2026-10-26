@@ -5,3 +5,4 @@ __pycache__/
 frontend/vite.log
 .cursor/
 backend/data/
+backend/models/
