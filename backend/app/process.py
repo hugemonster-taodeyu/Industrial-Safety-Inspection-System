@@ -96,6 +96,11 @@ def analyze_process_frame(image) -> dict:
     details = _detail_boxes(image)
     boxes = [_public_box(item, width, height) for item in details]
     with _lock:
+        step = _current() if _running else -1
+    people = _helmeted_people(image) if step == 1 else []
+    for person in people:
+        boxes.append(_public_box({**person, "name": "person"}, width, height))
+    with _lock:
         if not _running:
             return _status(boxes)
         step = _current()
@@ -103,9 +108,6 @@ def analyze_process_frame(image) -> dict:
             if any(item["name"] == "connect_ground_terminal" for item in details):
                 _passed[0] = True
         elif step == 1:
-            people = [person for person in detect._person_boxes(image) if detect._has_helmet(person, detect._helmet_boxes(image))]
-            for person in people:
-                boxes.append(_public_box({**person, "name": "person"}, width, height))
             _mark_sides(_transformer_box(details), people)
             if all(_sides.values()):
                 _passed[1] = True
@@ -142,6 +144,28 @@ def _detail_boxes(image) -> list[dict]:
         x1, y1, x2, y2 = [float(value) for value in xyxy]
         boxes.append({"name": name, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
     return boxes
+
+
+def _helmeted_people(image) -> list[dict]:
+    person_result = _predict(detect._person_model, image, classes=[0], imgsz=1280, conf=0.4)
+    helmet_result = _predict(detect._helmet_model, image, imgsz=1280, conf=0.35)
+    people = []
+    if person_result.boxes is not None:
+        for xyxy in person_result.boxes.xyxy.cpu().numpy():
+            x1, y1, x2, y2 = [float(value) for value in xyxy]
+            people.append({"name": "person", "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    helmets = []
+    names = helmet_result.names or {}
+    if helmet_result.boxes is not None:
+        for xyxy, cls in zip(helmet_result.boxes.xyxy.cpu().numpy(), helmet_result.boxes.cls.cpu().numpy()):
+            label = str(names.get(int(cls), "")).lower().replace("_", "").replace("-", "")
+            if "nohardhat" in label or "nohelmet" in label or label in {"head", "barehead"}:
+                continue
+            if "hardhat" not in label and "helmet" not in label and "安全帽" not in label:
+                continue
+            x1, y1, x2, y2 = [float(value) for value in xyxy]
+            helmets.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    return [person for person in people if detect._has_helmet(person, helmets)]
 
 
 def _public_box(box: dict, width: int, height: int) -> dict:

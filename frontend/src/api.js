@@ -3,8 +3,13 @@ async function request(url, options = {}) {
   const text = await response.text();
   const data = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    const message = data?.detail || "请求失败";
-    throw new Error(typeof message === "string" ? message : "请求失败");
+    const detail = data?.detail;
+    const message = typeof detail === "string"
+      ? detail
+      : Array.isArray(detail)
+        ? detail.map((item) => item.msg).filter(Boolean).join("；")
+        : "";
+    throw new Error(message || "请求失败");
   }
   return data;
 }
