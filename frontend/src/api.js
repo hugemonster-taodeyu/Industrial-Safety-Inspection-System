@@ -43,9 +43,10 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   startProcess: () => request("/api/process/start", { method: "POST" }),
-  processFrame: (blob) => {
+  processFrame: (blob, time) => {
     const body = new FormData();
     body.append("file", blob, "frame.jpg");
+    body.append("time", String(time));
     return request("/api/process/frame", { method: "POST", body });
   },
   detections: () => request("/api/detections"),

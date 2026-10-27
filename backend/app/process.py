@@ -18,7 +18,7 @@ LABELS = {
     "ground_terminal": "地线端子",
     "connect_ground_terminal": "连接地线端子",
     "stick_head": "导电棒尖端",
-    "person": "戴安全帽人员",
+    "person": "人员",
 }
 
 _lock = threading.Lock()
@@ -27,14 +27,32 @@ _device = 0
 _running = False
 _sides = {"left": False, "right": False, "front": False, "back": False}
 _parts = {name: False for name in WIRING_PARTS}
-_passed = [False, False, False, False]
+_start = {"terminal": False, "ground_terminal": False}
+_passed = [False, False, False]
+_layout = None
+_layout_seen = None
+_stable_since = None
+_fixed_box = None
+_box_updated_at = None
+_last_time = None
+LIMB_POINTS = (11, 12, 13, 14, 15, 16)
+LIMB_CONF = 0.55
+STABLE_SECONDS = 10
+UPDATE_SECONDS = 5
 
 
 def _fresh() -> None:
-    global _sides, _parts, _passed
+    global _sides, _parts, _start, _passed, _layout, _layout_seen, _stable_since, _fixed_box, _box_updated_at, _last_time
     _sides = {"left": False, "right": False, "front": False, "back": False}
     _parts = {name: False for name in WIRING_PARTS}
-    _passed = [False, False, False, False]
+    _start = {"terminal": False, "ground_terminal": False}
+    _passed = [False, False, False]
+    _layout = None
+    _layout_seen = None
+    _stable_since = None
+    _fixed_box = None
+    _box_updated_at = None
+    _last_time = None
 
 
 def _current() -> int:
@@ -52,7 +70,6 @@ def _status(boxes: list[dict] | None = None) -> dict:
             {"name": "启动", "passed": _passed[0]},
             {"name": "检查变压器", "passed": _passed[1], "sides": dict(_sides)},
             {"name": "接线", "passed": _passed[2], "parts": dict(_parts)},
-            {"name": "放电", "passed": _passed[3]},
         ],
         "boxes": boxes or [],
     }
@@ -72,9 +89,9 @@ def _ensure_detail() -> None:
 
 def start_process() -> dict:
     global _running
-    detect._ensure_models({3})
-    if detect._person_model is None or detect._helmet_model is None:
-        raise RuntimeError(detect._model_error or "人员或安全帽模型未就绪")
+    detect._ensure_models({4})
+    if detect._pose_model is None:
+        raise RuntimeError(detect._model_error or "姿态模型未就绪")
     _ensure_detail()
     with _lock:
         _fresh()
@@ -89,7 +106,7 @@ def stop_process() -> dict:
         return _status()
 
 
-def analyze_process_frame(image) -> dict:
+def analyze_process_frame(image, video_time: float = 0) -> dict:
     if not _running:
         return _status()
     height, width = image.shape[:2]
@@ -97,18 +114,21 @@ def analyze_process_frame(image) -> dict:
     boxes = [_public_box(item, width, height) for item in details]
     with _lock:
         step = _current() if _running else -1
-    people = _helmeted_people(image) if step == 1 else []
-    for person in people:
-        boxes.append(_public_box({**person, "name": "person"}, width, height))
+    poses = _poses(image) if step == 1 else []
+    for pose in poses:
+        boxes.append(_public_box({**pose, "name": "person"}, width, height))
     with _lock:
         if not _running:
             return _status(boxes)
+        _note_time(video_time)
         step = _current()
         if step == 0:
-            if any(item["name"] == "connect_ground_terminal" for item in details):
-                _passed[0] = True
-        elif step == 1:
-            _mark_sides(_transformer_box(details), people)
+            _observe_startup(details, video_time)
+            step = _current()
+        if step in (1, 2):
+            _refresh_transformer(details, video_time)
+        if step == 1:
+            _mark_sides(_fixed_box, poses)
             if all(_sides.values()):
                 _passed[1] = True
         elif step == 2:
@@ -117,8 +137,6 @@ def analyze_process_frame(image) -> dict:
                     _parts[item["name"]] = True
             if all(_parts.values()):
                 _passed[2] = True
-        if _current() == 3:
-            _passed[3] = True
         return _status(boxes)
 
 
@@ -146,26 +164,51 @@ def _detail_boxes(image) -> list[dict]:
     return boxes
 
 
-def _helmeted_people(image) -> list[dict]:
-    person_result = _predict(detect._person_model, image, classes=[0], imgsz=1280, conf=0.4)
-    helmet_result = _predict(detect._helmet_model, image, imgsz=1280, conf=0.35)
-    people = []
-    if person_result.boxes is not None:
-        for xyxy in person_result.boxes.xyxy.cpu().numpy():
-            x1, y1, x2, y2 = [float(value) for value in xyxy]
-            people.append({"name": "person", "x1": x1, "y1": y1, "x2": x2, "y2": y2})
-    helmets = []
-    names = helmet_result.names or {}
-    if helmet_result.boxes is not None:
-        for xyxy, cls in zip(helmet_result.boxes.xyxy.cpu().numpy(), helmet_result.boxes.cls.cpu().numpy()):
-            label = str(names.get(int(cls), "")).lower().replace("_", "").replace("-", "")
-            if "nohardhat" in label or "nohelmet" in label or label in {"head", "barehead"}:
-                continue
-            if "hardhat" not in label and "helmet" not in label and "安全帽" not in label:
-                continue
-            x1, y1, x2, y2 = [float(value) for value in xyxy]
-            helmets.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
-    return [person for person in people if detect._has_helmet(person, helmets)]
+def _poses(image) -> list[dict]:
+    result = _predict(detect._pose_model, image, conf=0.4)
+    poses = []
+    if result.keypoints is None or result.boxes is None:
+        return poses
+    points_all = result.keypoints.xy.cpu().numpy()
+    conf_tensor = result.keypoints.conf
+    scores_all = conf_tensor.cpu().numpy() if conf_tensor is not None else None
+    for index, box in enumerate(result.boxes.xyxy.cpu().numpy()):
+        points = points_all[index]
+        scores = scores_all[index] if scores_all is not None else [1.0] * len(points)
+        x1, y1, x2, y2 = [float(value) for value in box]
+        left_shoulder = detect._keypoint(points, scores, 5)
+        right_shoulder = detect._keypoint(points, scores, 6)
+        shoulder = None
+        if left_shoulder is not None and right_shoulder is not None:
+            shoulder = (
+                (left_shoulder[0] + right_shoulder[0]) / 2,
+                (left_shoulder[1] + right_shoulder[1]) / 2,
+            )
+        limb_points = []
+        for point_index in LIMB_POINTS:
+            point = _pose_point(points, scores, point_index, LIMB_CONF)
+            if point is not None:
+                limb_points.append(point)
+        poses.append(
+            {
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "shoulder": shoulder,
+                "limb_points": limb_points,
+            }
+        )
+    return poses
+
+
+def _pose_point(points, scores, index: int, minimum: float):
+    if index >= len(points) or float(scores[index]) < minimum:
+        return None
+    x, y = float(points[index][0]), float(points[index][1])
+    if x <= 0 and y <= 0:
+        return None
+    return x, y
 
 
 def _public_box(box: dict, width: int, height: int) -> dict:
@@ -179,6 +222,84 @@ def _public_box(box: dict, width: int, height: int) -> dict:
     }
 
 
+def _note_time(video_time: float) -> None:
+    global _last_time, _layout, _layout_seen, _stable_since
+    if _last_time is not None and abs(video_time - _last_time) > 1.5:
+        _layout = None
+        _layout_seen = None
+        _stable_since = None
+    _last_time = video_time
+
+
+def _observe_startup(details: list[dict], video_time: float) -> None:
+    global _layout, _layout_seen, _stable_since, _fixed_box, _box_updated_at, _passed
+    for item in details:
+        if item["name"] in _start:
+            _start[item["name"]] = True
+    if not all(_start.values()):
+        return
+    layout = _terminal_layout(details)
+    if layout is None:
+        if _layout_seen is not None and video_time - _layout_seen > 1.5:
+            _layout = None
+            _layout_seen = None
+            _stable_since = None
+        return
+    _layout_seen = video_time
+    if _layout is None or not _layout_stable(_layout, layout):
+        _layout = layout
+        _stable_since = video_time
+        return
+    if video_time - _stable_since >= STABLE_SECONDS:
+        _fixed_box = dict(layout[0])
+        _box_updated_at = video_time
+        _passed[0] = True
+
+
+def _refresh_transformer(details: list[dict], video_time: float) -> None:
+    global _fixed_box, _box_updated_at
+    if _fixed_box is None or _box_updated_at is None:
+        return
+    if video_time - _box_updated_at < UPDATE_SECONDS:
+        return
+    box = _transformer_box(details)
+    if box is None:
+        return
+    _fixed_box = box
+    _box_updated_at = video_time
+
+
+def _terminal_layout(details: list[dict]):
+    box = _transformer_box(details)
+    grounds = [item for item in details if item["name"] == "ground_terminal"]
+    if box is None or not grounds:
+        return None
+    centers = sorted(
+        (((item["x1"] + item["x2"]) / 2, (item["y1"] + item["y2"]) / 2) for item in grounds),
+        key=lambda point: (point[0], point[1]),
+    )
+    return box, centers
+
+
+def _layout_stable(previous, current) -> bool:
+    old_box, old_grounds = previous
+    new_box, new_grounds = current
+    if len(old_grounds) != len(new_grounds):
+        return False
+    width = max(old_box["x2"] - old_box["x1"], 1)
+    height = max(old_box["y2"] - old_box["y1"], 1)
+    limit_x = max(width * 0.12, 12)
+    limit_y = max(height * 0.5, width * 0.06, 12)
+    for key in ("x1", "y1", "x2", "y2"):
+        limit = limit_x if key.startswith("x") else limit_y
+        if abs(old_box[key] - new_box[key]) > limit:
+            return False
+    for old, new in zip(old_grounds, new_grounds):
+        if abs(old[0] - new[0]) > limit_x or abs(old[1] - new[1]) > limit_y:
+            return False
+    return True
+
+
 def _transformer_box(details: list[dict]) -> dict | None:
     terminals = [item for item in details if item["name"] == "terminal"]
     if len(terminals) < 3:
@@ -188,18 +309,12 @@ def _transformer_box(details: list[dict]) -> dict | None:
     for combo in itertools.combinations(terminals, 3):
         centers_y = [((item["y1"] + item["y2"]) / 2) for item in combo]
         centers_x = [((item["x1"] + item["x2"]) / 2) for item in combo]
-        heights = [item["y2"] - item["y1"] for item in combo]
-        mean_height = max(sum(heights) / 3, 1)
         y_spread = max(centers_y) - min(centers_y)
         x_spread = max(centers_x) - min(centers_x)
-        if x_spread < mean_height or y_spread > mean_height * 1.2:
-            continue
-        score = y_spread / x_spread
+        score = y_spread / max(x_spread, 1)
         if score < best_score:
             best_score = score
             best = combo
-    if best is None:
-        return None
     return {
         "x1": min(item["x1"] for item in best),
         "y1": min(item["y1"] for item in best),
@@ -211,23 +326,21 @@ def _transformer_box(details: list[dict]) -> dict | None:
 def _mark_sides(transformer: dict | None, people: list[dict]) -> None:
     if transformer is None:
         return
-    width = max(transformer["x2"] - transformer["x1"], 1)
     height = max(transformer["y2"] - transformer["y1"], 1)
-    reach_x = width * 2.5
     reach_y = height * 3
     for person in people:
         center_x = (person["x1"] + person["x2"]) / 2
         center_y = (person["y1"] + person["y2"]) / 2
         near_row = transformer["y1"] - reach_y <= center_y <= transformer["y2"] + reach_y
-        near_col = transformer["x1"] - reach_x <= center_x <= transformer["x2"] + reach_x
-        behind = center_y < (transformer["y1"] + transformer["y2"]) / 2
-        if center_x < transformer["x1"] and near_row:
+        shoulder = person["shoulder"]
+        if shoulder is not None and transformer["x1"] <= shoulder[0] <= transformer["x2"]:
+            foreground_y = transformer["y2"] + height
+            limb_in_front = any(point[1] > foreground_y for point in person["limb_points"])
+            if limb_in_front:
+                _sides["front"] = True
+            elif shoulder[1] <= foreground_y:
+                _sides["back"] = True
+        elif center_x < transformer["x1"] and near_row:
             _sides["left"] = True
-            _sides["back"] = True
-        if center_x > transformer["x2"] and near_row:
+        elif center_x > transformer["x2"] and near_row:
             _sides["right"] = True
-            _sides["back"] = True
-        if behind and center_y < transformer["y1"] and near_col:
-            _sides["back"] = True
-        if center_y > transformer["y2"] and near_col:
-            _sides["front"] = True

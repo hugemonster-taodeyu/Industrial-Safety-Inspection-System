@@ -1,0 +1,13 @@
+path: D:\CODE\ISS\model_train\dataset
+train: images/train
+val: images/val
+
+names:
+  0: terminal
+  1: connect_terminal_a
+  2: connect_terminal_b
+  3: connect_terminal_c
+  4: cable_connect_terminal
+  5: ground_terminal
+  6: connect_ground_terminal
+  7: stick_head

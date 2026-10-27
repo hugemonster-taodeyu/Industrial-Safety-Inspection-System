@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -891,7 +891,7 @@ def end_process():
 
 
 @app.post("/api/process/frame")
-async def process_frame(file: UploadFile = File(...)):
+async def process_frame(file: UploadFile = File(...), time: float = Form(0)):
     import cv2
 
     data = await file.read()
@@ -899,7 +899,7 @@ async def process_frame(file: UploadFile = File(...)):
     if image is None:
         raise HTTPException(400, "无法读取画面")
     try:
-        return analyze_process_frame(image)
+        return analyze_process_frame(image, time)
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
 

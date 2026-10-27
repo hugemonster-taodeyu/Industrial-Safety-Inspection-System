@@ -1,12 +1,11 @@
 <template>
   <div>
     <h1 class="page-title">流程检测</h1>
-    <div class="note">选择本地视频后点击「开始」。每 25 帧检测一次，检测完才显示这一帧和它的框，然后再跳到后面的帧。</div>
     <p v-if="error" class="error">{{ error }}</p>
     <div class="live">
       <div>
         <div class="process-stage">
-          <video v-if="videoUrl" ref="videoEl" :class="{ 'hidden-decoder': stillUrl }" :src="videoUrl" controls @loadedmetadata="onMeta"></video>
+          <video v-if="videoUrl" ref="videoEl" :class="{ 'hidden-decoder': stillUrl }" :src="videoUrl" controls @loadedmetadata="onMeta" @timeupdate="onTime"></video>
           <img v-if="stillUrl" class="process-frame" :src="stillUrl" alt="" />
           <svg v-if="stillUrl && boxes.length" class="process-overlay" viewBox="0 0 1 1" preserveAspectRatio="none">
             <rect
@@ -82,7 +81,7 @@
 </template>
 
 <script setup>
-import { onUnmounted, ref } from "vue";
+import { nextTick, onUnmounted, ref } from "vue";
 import { api } from "../api";
 
 const steps = ref(blankSteps());
@@ -100,13 +99,13 @@ const slider = ref(0);
 let stillObjectUrl = "";
 let scrubbing = false;
 let pendingSeek = null;
+let processFinished = false;
 
 function blankSteps() {
   return [
     { name: "启动", passed: false },
     { name: "检查变压器", passed: false, sides: { front: false, back: false, left: false, right: false } },
     { name: "接线", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
-    { name: "放电", passed: false },
   ];
 }
 
@@ -121,6 +120,13 @@ function onMeta() {
   const video = videoEl.value;
   if (!video) return;
   duration.value = video.duration || 0;
+}
+
+function onTime() {
+  const video = videoEl.value;
+  if (!video || scrubbing || running.value) return;
+  time.value = video.currentTime;
+  if (video.duration) slider.value = Math.round((video.currentTime / video.duration) * 1000);
 }
 
 function onSliderInput(event) {
@@ -153,7 +159,10 @@ function applyStatus(status) {
   steps.value = status.steps;
   current.value = status.current;
   boxes.value = status.boxes || [];
-  if (status.current >= status.steps.length) running.value = false;
+  if (status.current >= status.steps.length) {
+    running.value = false;
+    processFinished = true;
+  }
 }
 
 function clearStill() {
@@ -184,6 +193,7 @@ function onFile(event) {
   duration.value = 0;
   slider.value = 0;
   pendingSeek = null;
+  processFinished = false;
   error.value = "";
 }
 
@@ -199,6 +209,7 @@ function clearVideo() {
   duration.value = 0;
   slider.value = 0;
   pendingSeek = null;
+  processFinished = false;
 }
 
 function seek(video, time) {
@@ -243,8 +254,21 @@ async function start() {
   await runFrames();
 }
 
+async function playRest(video) {
+  clearStill();
+  boxes.value = [];
+  await nextTick();
+  if (video.currentTime >= video.duration - 0.05) return;
+  try {
+    await video.play();
+  } catch {
+    // 浏览器拦截自动播放时，画面已经回到视频，可以用控件继续播放。
+  }
+}
+
 async function runFrames() {
   const video = videoEl.value;
+  processFinished = false;
   while (running.value && video) {
     if (pendingSeek != null) {
       const target = pendingSeek;
@@ -261,7 +285,7 @@ async function runFrames() {
     if (pendingSeek != null) continue;
     let status;
     try {
-      status = await api.processFrame(blob);
+      status = await api.processFrame(blob, video.currentTime);
     } catch (err) {
       error.value = err.message;
       stopLoop();
@@ -275,13 +299,14 @@ async function runFrames() {
       slider.value = Math.round((video.currentTime / video.duration) * 1000);
     }
     if (!running.value || pendingSeek != null) continue;
-    const next = Math.min(video.duration, video.currentTime + 25 / 25);
+    const next = Math.min(video.duration, video.currentTime + 10 / 25);
     if (next >= video.duration - 0.001) {
       stopLoop();
       break;
     }
     await seek(video, next);
   }
+  if (processFinished && video) await playRest(video);
 }
 
 function stopLoop() {
