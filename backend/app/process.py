@@ -33,16 +33,20 @@ _layout = None
 _layout_seen = None
 _stable_since = None
 _fixed_box = None
+_fixed_terminals = None
 _box_updated_at = None
 _last_time = None
+_front_since = None
 LIMB_POINTS = (11, 12, 13, 14, 15, 16)
 LIMB_CONF = 0.55
 STABLE_SECONDS = 10
 UPDATE_SECONDS = 5
+FRONT_SECONDS = 0.4
 
 
 def _fresh() -> None:
-    global _sides, _parts, _start, _passed, _layout, _layout_seen, _stable_since, _fixed_box, _box_updated_at, _last_time
+    global _sides, _parts, _start, _passed, _layout, _layout_seen, _stable_since
+    global _fixed_box, _fixed_terminals, _box_updated_at, _last_time, _front_since
     _sides = {"left": False, "right": False, "front": False, "back": False}
     _parts = {name: False for name in WIRING_PARTS}
     _start = {"terminal": False, "ground_terminal": False}
@@ -51,8 +55,10 @@ def _fresh() -> None:
     _layout_seen = None
     _stable_since = None
     _fixed_box = None
+    _fixed_terminals = None
     _box_updated_at = None
     _last_time = None
+    _front_since = None
 
 
 def _current() -> int:
@@ -128,7 +134,7 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
         if step in (1, 2):
             _refresh_transformer(details, video_time)
         if step == 1:
-            _mark_sides(_fixed_box, poses)
+            _mark_sides(_fixed_box, poses, details, video_time)
             if all(_sides.values()):
                 _passed[1] = True
         elif step == 2:
@@ -223,16 +229,17 @@ def _public_box(box: dict, width: int, height: int) -> dict:
 
 
 def _note_time(video_time: float) -> None:
-    global _last_time, _layout, _layout_seen, _stable_since
+    global _last_time, _layout, _layout_seen, _stable_since, _front_since
     if _last_time is not None and abs(video_time - _last_time) > 1.5:
         _layout = None
         _layout_seen = None
         _stable_since = None
+        _front_since = None
     _last_time = video_time
 
 
 def _observe_startup(details: list[dict], video_time: float) -> None:
-    global _layout, _layout_seen, _stable_since, _fixed_box, _box_updated_at, _passed
+    global _layout, _layout_seen, _stable_since, _fixed_box, _fixed_terminals, _box_updated_at, _passed
     for item in details:
         if item["name"] in _start:
             _start[item["name"]] = True
@@ -252,38 +259,42 @@ def _observe_startup(details: list[dict], video_time: float) -> None:
         return
     if video_time - _stable_since >= STABLE_SECONDS:
         _fixed_box = dict(layout[0])
+        _fixed_terminals = [dict(item) for item in layout[2]]
         _box_updated_at = video_time
         _passed[0] = True
 
 
 def _refresh_transformer(details: list[dict], video_time: float) -> None:
-    global _fixed_box, _box_updated_at
+    global _fixed_box, _fixed_terminals, _box_updated_at
     if _fixed_box is None or _box_updated_at is None:
         return
     if video_time - _box_updated_at < UPDATE_SECONDS:
         return
-    box = _transformer_box(details)
-    if box is None:
+    selected = _transformer_selection(details)
+    if selected is None:
         return
+    box, terminals = selected
     _fixed_box = box
+    _fixed_terminals = [dict(item) for item in terminals]
     _box_updated_at = video_time
 
 
 def _terminal_layout(details: list[dict]):
-    box = _transformer_box(details)
+    selected = _transformer_selection(details)
     grounds = [item for item in details if item["name"] == "ground_terminal"]
-    if box is None or not grounds:
+    if selected is None or not grounds:
         return None
+    box, terminals = selected
     centers = sorted(
         (((item["x1"] + item["x2"]) / 2, (item["y1"] + item["y2"]) / 2) for item in grounds),
         key=lambda point: (point[0], point[1]),
     )
-    return box, centers
+    return box, centers, terminals
 
 
 def _layout_stable(previous, current) -> bool:
-    old_box, old_grounds = previous
-    new_box, new_grounds = current
+    old_box, old_grounds = previous[0], previous[1]
+    new_box, new_grounds = current[0], current[1]
     if len(old_grounds) != len(new_grounds):
         return False
     width = max(old_box["x2"] - old_box["x1"], 1)
@@ -301,6 +312,13 @@ def _layout_stable(previous, current) -> bool:
 
 
 def _transformer_box(details: list[dict]) -> dict | None:
+    selected = _transformer_selection(details)
+    if selected is None:
+        return None
+    return selected[0]
+
+
+def _transformer_selection(details: list[dict]):
     terminals = [item for item in details if item["name"] == "terminal"]
     if len(terminals) < 3:
         return None
@@ -315,32 +333,73 @@ def _transformer_box(details: list[dict]) -> dict | None:
         if score < best_score:
             best_score = score
             best = combo
-    return {
+    box = {
         "x1": min(item["x1"] for item in best),
         "y1": min(item["y1"] for item in best),
         "x2": max(item["x2"] for item in best),
         "y2": max(item["y2"] for item in best),
     }
+    return box, best
 
 
-def _mark_sides(transformer: dict | None, people: list[dict]) -> None:
+def _terminal_visible(saved: dict, current: dict) -> bool:
+    saved_x = (saved["x1"] + saved["x2"]) / 2
+    saved_y = (saved["y1"] + saved["y2"]) / 2
+    current_x = (current["x1"] + current["x2"]) / 2
+    current_y = (current["y1"] + current["y2"]) / 2
+    width = max(saved["x2"] - saved["x1"], 1)
+    height = max(saved["y2"] - saved["y1"], 1)
+    return abs(saved_x - current_x) <= max(width, 24) and abs(saved_y - current_y) <= max(height * 2, 24)
+
+
+def _terminal_occluded(details: list[dict]) -> bool:
+    if not _fixed_terminals:
+        return False
+    visible = [item for item in details if item["name"] == "terminal"]
+    for saved in _fixed_terminals:
+        if not any(_terminal_visible(saved, item) for item in visible):
+            return True
+    return False
+
+
+def _person_near_transformer(person: dict, transformer: dict) -> bool:
+    width = max(transformer["x2"] - transformer["x1"], 1)
+    height = max(transformer["y2"] - transformer["y1"], 1)
+    left = transformer["x1"] - width * 0.2
+    right = transformer["x2"] + width * 0.2
+    top = transformer["y1"] - height * 4
+    bottom = transformer["y2"] + height * 8
+    return person["x1"] < right and person["x2"] > left and person["y1"] < bottom and person["y2"] > top
+
+
+def _mark_sides(transformer: dict | None, people: list[dict], details: list[dict], video_time: float) -> None:
+    global _front_since
     if transformer is None:
         return
+    covered = _terminal_occluded(details) and any(_person_near_transformer(person, transformer) for person in people)
+    if covered:
+        if _front_since is None:
+            _front_since = video_time
+        elif video_time - _front_since >= FRONT_SECONDS:
+            _sides["front"] = True
+    else:
+        _front_since = None
     height = max(transformer["y2"] - transformer["y1"], 1)
     reach_y = height * 3
     for person in people:
         center_x = (person["x1"] + person["x2"]) / 2
         center_y = (person["y1"] + person["y2"]) / 2
         near_row = transformer["y1"] - reach_y <= center_y <= transformer["y2"] + reach_y
-        shoulder = person["shoulder"]
-        if shoulder is not None and transformer["x1"] <= shoulder[0] <= transformer["x2"]:
-            foreground_y = transformer["y2"] + height
-            limb_in_front = any(point[1] > foreground_y for point in person["limb_points"])
-            if limb_in_front:
-                _sides["front"] = True
-            elif shoulder[1] <= foreground_y:
-                _sides["back"] = True
-        elif center_x < transformer["x1"] and near_row:
+        if center_x < transformer["x1"] and near_row:
             _sides["left"] = True
-        elif center_x > transformer["x2"] and near_row:
+            continue
+        if center_x > transformer["x2"] and near_row:
             _sides["right"] = True
+            continue
+        shoulder = person["shoulder"]
+        if shoulder is None or not (transformer["x1"] <= shoulder[0] <= transformer["x2"]):
+            continue
+        foreground_y = transformer["y2"] + height
+        limb_in_front = any(point[1] > foreground_y for point in person["limb_points"])
+        if not limb_in_front and shoulder[1] <= foreground_y:
+            _sides["back"] = True

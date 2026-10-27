@@ -1,7 +1,20 @@
 async function request(url, options = {}) {
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch {
+    throw new Error("后端没有响应，请先启动后端");
+  }
   const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      if (!response.ok) throw new Error("后端没有响应，请先启动后端");
+      throw new Error("返回内容无法读取");
+    }
+  }
   if (!response.ok) {
     const detail = data?.detail;
     const message = typeof detail === "string"
