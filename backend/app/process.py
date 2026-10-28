@@ -28,7 +28,10 @@ _running = False
 _sides = {"left": False, "right": False, "front": False, "back": False}
 _parts = {name: False for name in WIRING_PARTS}
 _start = {"terminal": False, "ground_terminal": False}
-_passed = [False, False, False]
+_passed = [False, False, False, False]
+_end_since = None
+_end_seen_at = None
+_end_parts = {name: False for name in WIRING_PARTS}
 _layout = None
 _layout_seen = None
 _stable_since = None
@@ -45,12 +48,15 @@ FRONT_SECONDS = 0.4
 
 
 def _fresh() -> None:
-    global _sides, _parts, _start, _passed, _layout, _layout_seen, _stable_since
+    global _sides, _parts, _start, _passed, _end_since, _end_seen_at, _end_parts, _layout, _layout_seen, _stable_since
     global _fixed_box, _fixed_terminals, _box_updated_at, _last_time, _front_since
     _sides = {"left": False, "right": False, "front": False, "back": False}
     _parts = {name: False for name in WIRING_PARTS}
     _start = {"terminal": False, "ground_terminal": False}
-    _passed = [False, False, False]
+    _passed = [False, False, False, False]
+    _end_since = None
+    _end_seen_at = None
+    _end_parts = {name: False for name in WIRING_PARTS}
     _layout = None
     _layout_seen = None
     _stable_since = None
@@ -76,6 +82,7 @@ def _status(boxes: list[dict] | None = None) -> dict:
             {"name": "启动", "passed": _passed[0]},
             {"name": "检查变压器", "passed": _passed[1], "sides": dict(_sides)},
             {"name": "接线", "passed": _passed[2], "parts": dict(_parts)},
+            {"name": "结束", "passed": _passed[3], "parts": dict(_end_parts)},
         ],
         "boxes": boxes or [],
     }
@@ -143,6 +150,8 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
                     _parts[item["name"]] = True
             if all(_parts.values()):
                 _passed[2] = True
+        elif step == 3:
+            _observe_finish(details, video_time)
         return _status(boxes)
 
 
@@ -229,13 +238,38 @@ def _public_box(box: dict, width: int, height: int) -> dict:
 
 
 def _note_time(video_time: float) -> None:
-    global _last_time, _layout, _layout_seen, _stable_since, _front_since
+    global _last_time, _layout, _layout_seen, _stable_since, _front_since, _end_since, _end_seen_at, _end_parts
     if _last_time is not None and abs(video_time - _last_time) > 1.5:
         _layout = None
         _layout_seen = None
         _stable_since = None
         _front_since = None
+        _end_since = None
+        _end_seen_at = None
+        _end_parts = {name: False for name in WIRING_PARTS}
     _last_time = video_time
+
+
+def _observe_finish(details: list[dict], video_time: float) -> None:
+    global _end_since, _end_seen_at, _end_parts, _passed
+    present = {name: any(item["name"] == name for item in details) for name in WIRING_PARTS}
+    if all(present.values()):
+        if _end_since is None or (_end_seen_at is not None and video_time - _end_seen_at > 1.5):
+            _end_since = video_time
+            _end_parts = {name: False for name in WIRING_PARTS}
+        _end_seen_at = video_time
+        for name in WIRING_PARTS:
+            _end_parts[name] = True
+        if video_time - _end_since >= STABLE_SECONDS:
+            _passed[3] = True
+        return
+    for name, seen in present.items():
+        if seen:
+            _end_parts[name] = True
+    if _end_seen_at is not None and video_time - _end_seen_at > 1.5:
+        _end_since = None
+        _end_seen_at = None
+        _end_parts = {name: False for name in WIRING_PARTS}
 
 
 def _observe_startup(details: list[dict], video_time: float) -> None:

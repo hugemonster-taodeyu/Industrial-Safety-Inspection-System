@@ -51,7 +51,6 @@
       <aside class="panel process-panel">
         <div class="process-head">
           <h2>检测流程</h2>
-          <button class="btn" type="button" :disabled="!videoUrl || running" @click="start">{{ running ? "检测中" : "开始" }}</button>
         </div>
         <ol class="steps">
           <li v-for="(step, index) in steps" :key="step.name" class="step" :class="{ passed: step.passed, current: running && index === current }">
@@ -80,7 +79,7 @@
 </template>
 
 <script setup>
-import { onUnmounted, ref } from "vue";
+import { nextTick, onUnmounted, ref } from "vue";
 import { api } from "../api";
 
 const steps = ref(blankSteps());
@@ -106,6 +105,7 @@ function blankSteps() {
     { name: "启动", passed: false },
     { name: "检查变压器", passed: false, sides: { front: false, back: false, left: false, right: false } },
     { name: "接线", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
+    { name: "结束", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
   ];
 }
 
@@ -170,8 +170,9 @@ function applyStatus(status) {
   if (finished) stopLoop();
 }
 
-function onFile(event) {
+async function onFile(event) {
   const file = event.target.files?.[0];
+  event.target.value = "";
   if (!file) return;
   stopLoop();
   if (videoUrl.value) URL.revokeObjectURL(videoUrl.value);
@@ -184,6 +185,8 @@ function onFile(event) {
   duration.value = 0;
   slider.value = 0;
   error.value = "";
+  await nextTick();
+  await start();
 }
 
 function clearVideo() {
@@ -212,22 +215,23 @@ async function start() {
   if (!video) return;
   error.value = "";
   boxes.value = [];
-  try {
-    applyStatus(await api.startProcess());
-  } catch (err) {
-    error.value = err.message;
-    return;
-  }
   if (video.readyState < 2) {
     await new Promise((resolve) => video.addEventListener("loadeddata", resolve, { once: true }));
+  }
+  try {
+    await video.play();
+  } catch (err) {
+    error.value = err.message || "无法播放视频";
+    return;
   }
   running.value = true;
   lastSampleTime = -1;
   try {
-    await video.play();
+    applyStatus(await api.startProcess());
   } catch (err) {
+    video.pause();
     stopLoop();
-    error.value = err.message || "无法播放视频";
+    error.value = err.message;
     return;
   }
   beginSampling(video);
