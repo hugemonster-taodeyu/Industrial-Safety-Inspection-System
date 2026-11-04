@@ -63,6 +63,10 @@
                 <span :class="{ on: step.sides.left }">左</span>
                 <span :class="{ on: step.sides.right }">右</span>
               </span>
+              <span v-if="step.hands" class="side-row">
+                <span :class="{ on: step.hands.left }">左手</span>
+                <span :class="{ on: step.hands.right }">右手</span>
+              </span>
               <span v-if="step.parts" class="side-row">
                 <span :class="{ on: step.parts.connect_terminal_a }">A</span>
                 <span :class="{ on: step.parts.connect_terminal_b }">B</span>
@@ -105,6 +109,7 @@ function blankSteps() {
     { name: "启动", passed: false },
     { name: "检查变压器", passed: false, sides: { front: false, back: false, left: false, right: false } },
     { name: "接线", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
+    { name: "佩戴手套", passed: false, hands: { left: false, right: false } },
     { name: "结束", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
   ];
 }

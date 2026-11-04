@@ -1,4 +1,5 @@
 import itertools
+import math
 import threading
 
 from . import detect
@@ -19,16 +20,22 @@ LABELS = {
     "connect_ground_terminal": "连接地线端子",
     "stick_head": "导电棒尖端",
     "person": "人员",
+    "glove": "绝缘手套",
 }
+
+GLOVE_WEIGHTS = detect.MODELS / "glove.pt"
+ELBOW_REACH = 0.5
 
 _lock = threading.Lock()
 _detail_model = None
+_glove_model = None
 _device = 0
 _running = False
 _sides = {"left": False, "right": False, "front": False, "back": False}
 _parts = {name: False for name in WIRING_PARTS}
 _start = {"terminal": False, "ground_terminal": False}
-_passed = [False, False, False, False]
+_passed = [False, False, False, False, False]
+_hands = {"left": False, "right": False}
 _end_since = None
 _end_seen_at = None
 _end_parts = {name: False for name in WIRING_PARTS}
@@ -48,12 +55,13 @@ FRONT_SECONDS = 0.4
 
 
 def _fresh() -> None:
-    global _sides, _parts, _start, _passed, _end_since, _end_seen_at, _end_parts, _layout, _layout_seen, _stable_since
+    global _sides, _parts, _start, _passed, _hands, _end_since, _end_seen_at, _end_parts, _layout, _layout_seen, _stable_since
     global _fixed_box, _fixed_terminals, _box_updated_at, _last_time, _front_since
     _sides = {"left": False, "right": False, "front": False, "back": False}
     _parts = {name: False for name in WIRING_PARTS}
     _start = {"terminal": False, "ground_terminal": False}
-    _passed = [False, False, False, False]
+    _passed = [False, False, False, False, False]
+    _hands = {"left": False, "right": False}
     _end_since = None
     _end_seen_at = None
     _end_parts = {name: False for name in WIRING_PARTS}
@@ -82,10 +90,22 @@ def _status(boxes: list[dict] | None = None) -> dict:
             {"name": "启动", "passed": _passed[0]},
             {"name": "检查变压器", "passed": _passed[1], "sides": dict(_sides)},
             {"name": "接线", "passed": _passed[2], "parts": dict(_parts)},
-            {"name": "结束", "passed": _passed[3], "parts": dict(_end_parts)},
+            {"name": "佩戴手套", "passed": _passed[3], "hands": dict(_hands)},
+            {"name": "结束", "passed": _passed[4], "parts": dict(_end_parts)},
         ],
         "boxes": boxes or [],
     }
+
+
+def _ensure_glove() -> None:
+    global _glove_model
+    if _glove_model is not None:
+        return
+    from ultralytics import YOLO
+
+    if not GLOVE_WEIGHTS.is_file():
+        raise FileNotFoundError(f"未找到手套模型 {GLOVE_WEIGHTS}")
+    _glove_model = YOLO(detect._model_file(GLOVE_WEIGHTS))
 
 
 def _ensure_detail() -> None:
@@ -94,9 +114,9 @@ def _ensure_detail() -> None:
         return
     from ultralytics import YOLO
 
-    path = detect.MODELS / "best.pt"
+    path = detect.MODELS / "terminal.pt"
     if not path.exists():
-        raise FileNotFoundError("未找到变压器细节模型 best.pt")
+        raise FileNotFoundError("未找到变压器细节模型 terminal.pt")
     _detail_model = YOLO(detect._model_file(path))
 
 
@@ -106,6 +126,7 @@ def start_process() -> dict:
     if detect._pose_model is None:
         raise RuntimeError(detect._model_error or "姿态模型未就绪")
     _ensure_detail()
+    _ensure_glove()
     with _lock:
         _fresh()
         _running = True
@@ -127,7 +148,10 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
     boxes = [_public_box(item, width, height) for item in details]
     with _lock:
         step = _current() if _running else -1
-    poses = _poses(image) if step == 1 else []
+    poses = _poses(image) if step in (1, 3) else []
+    gloves = _detect_gloves(image) if step == 3 else []
+    for item in gloves:
+        boxes.append(_public_box(item, width, height))
     for pose in poses:
         boxes.append(_public_box({**pose, "name": "person"}, width, height))
     with _lock:
@@ -151,6 +175,8 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
             if all(_parts.values()):
                 _passed[2] = True
         elif step == 3:
+            _observe_gloves(gloves, poses)
+        elif step == 4:
             _observe_finish(details, video_time)
         return _status(boxes)
 
@@ -212,6 +238,10 @@ def _poses(image) -> list[dict]:
                 "y2": y2,
                 "shoulder": shoulder,
                 "limb_points": limb_points,
+                "left_elbow": detect._keypoint(points, scores, 7),
+                "right_elbow": detect._keypoint(points, scores, 8),
+                "left_wrist": detect._keypoint(points, scores, 9),
+                "right_wrist": detect._keypoint(points, scores, 10),
             }
         )
     return poses
@@ -250,6 +280,83 @@ def _note_time(video_time: float) -> None:
     _last_time = video_time
 
 
+def _detect_gloves(image) -> list[dict]:
+    result = _predict(_glove_model, image, imgsz=1280, conf=0.25)
+    names = result.names or {}
+    boxes = []
+    if result.boxes is None:
+        return boxes
+    for xyxy, cls in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy()):
+        if str(names.get(int(cls), "")) != "glove":
+            continue
+        x1, y1, x2, y2 = [float(value) for value in xyxy]
+        boxes.append({"name": "glove", "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    return boxes
+
+
+def _point_inside(point: tuple[float, float], box: dict) -> bool:
+    x, y = point
+    return box["x1"] <= x <= box["x2"] and box["y1"] <= y <= box["y2"]
+
+
+def _point_box_distance(point: tuple[float, float], box: dict) -> float:
+    x, y = point
+    dx = max(box["x1"] - x, 0.0, x - box["x2"])
+    dy = max(box["y1"] - y, 0.0, y - box["y2"])
+    return math.hypot(dx, dy)
+
+
+def _worn_hands(gloves: list[dict], poses: list[dict]) -> set[tuple[int, str]]:
+    hands = []
+    for person, pose in enumerate(poses):
+        for side in ("left", "right"):
+            wrist = pose.get(f"{side}_wrist")
+            if wrist is None:
+                continue
+            elbow = pose.get(f"{side}_elbow")
+            forearm = None
+            if elbow is not None:
+                forearm = math.hypot(elbow[0] - wrist[0], elbow[1] - wrist[1])
+            hands.append({"person": person, "side": side, "elbow": elbow, "wrist": wrist, "forearm": forearm})
+    occupancy = [0] * len(gloves)
+    for hand in hands:
+        for index, box in enumerate(gloves):
+            if _point_inside(hand["wrist"], box):
+                occupancy[index] += 1
+    candidates = []
+    for hand in hands:
+        if hand["elbow"] is None or hand["forearm"] is None:
+            continue
+        for index, box in enumerate(gloves):
+            if occupancy[index] != 1 or not _point_inside(hand["wrist"], box):
+                continue
+            distance = _point_box_distance(hand["elbow"], box)
+            if distance > ELBOW_REACH * hand["forearm"]:
+                continue
+            candidates.append((distance, hand["person"], hand["side"], index))
+    worn: set[tuple[int, str]] = set()
+    used_boxes: set[int] = set()
+    for _distance, person, side, index in sorted(candidates):
+        key = (person, side)
+        if key in worn or index in used_boxes:
+            continue
+        worn.add(key)
+        used_boxes.add(index)
+    return worn
+
+
+def _observe_gloves(gloves: list[dict], poses: list[dict]) -> None:
+    global _hands, _passed
+    worn = _worn_hands(gloves, poses)
+    by_person: dict[int, set[str]] = {}
+    for person, side in worn:
+        by_person.setdefault(person, set()).add(side)
+    chosen = max(by_person.values(), key=len) if by_person else set()
+    _hands = {"left": "left" in chosen, "right": "right" in chosen}
+    if _hands["left"] and _hands["right"]:
+        _passed[3] = True
+
+
 def _observe_finish(details: list[dict], video_time: float) -> None:
     global _end_since, _end_seen_at, _end_parts, _passed
     present = {name: any(item["name"] == name for item in details) for name in WIRING_PARTS}
@@ -261,7 +368,7 @@ def _observe_finish(details: list[dict], video_time: float) -> None:
         for name in WIRING_PARTS:
             _end_parts[name] = True
         if video_time - _end_since >= STABLE_SECONDS:
-            _passed[3] = True
+            _passed[4] = True
         return
     for name, seen in present.items():
         if seen:
