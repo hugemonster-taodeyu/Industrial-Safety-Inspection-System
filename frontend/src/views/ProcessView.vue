@@ -110,6 +110,8 @@ function blankSteps() {
     { name: "检查变压器", passed: false, sides: { front: false, back: false, left: false, right: false } },
     { name: "接线", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
     { name: "佩戴手套", passed: false, hands: { left: false, right: false } },
+    { name: "拿起导电棒", passed: false, hands: { left: false, right: false } },
+    { name: "放电", passed: false },
     { name: "结束", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
   ];
 }

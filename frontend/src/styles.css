@@ -112,7 +112,10 @@ a { color: inherit; text-decoration: none; }
 .video-wrap img,
 .process-video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
 .file-input { display: none; }
-.process-panel { max-height: none; }
+.panel.process-panel {
+  max-height: none;
+  overflow: visible;
+}
 .process-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .process-head h2 { margin-bottom: 0; }
 .process-stage { position: relative; background: #070b10; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }

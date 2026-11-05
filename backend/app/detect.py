@@ -12,9 +12,6 @@ import numpy as np
 from .database import SNAPSHOT_DIR, execute, query_all, query_one
 
 MODELS = Path(__file__).resolve().parent.parent / "models"
-HELMET_URL = "https://huggingface.co/keremberke/yolov8n-hard-hat-detection/resolve/main/best.pt"
-FACE_DET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
-FACE_REC_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 FACE_THRESHOLD = 0.363
 PRESENCE_SECONDS = 15
 TRACKED_CODES = {1, 2, 3, 4, 5}
@@ -271,24 +268,15 @@ def _ensure_models(codes: set[int]) -> bool:
         import cv2
         from ultralytics import YOLO
 
-        MODELS.mkdir(parents=True, exist_ok=True)
         if need_person and _person_model is None:
             _person_model = YOLO(_model_file(MODELS / "yolo11n.pt"))
         if need_face and _face_detector is None:
-            det_path = MODELS / "face_detection_yunet.onnx"
-            rec_path = MODELS / "face_recognition_sface.onnx"
-            if not det_path.exists():
-                _download(FACE_DET_URL, det_path)
-            if not rec_path.exists():
-                _download(FACE_REC_URL, rec_path)
-            _face_detector = cv2.FaceDetectorYN.create(_model_file(det_path), "", (320, 320), 0.6, 0.3, 5000)
-            _face_recognizer = cv2.FaceRecognizerSF.create(_model_file(rec_path), "")
+            det_path = _model_file(MODELS / "face_detection_yunet.onnx")
+            rec_path = _model_file(MODELS / "face_recognition_sface.onnx")
+            _face_detector = cv2.FaceDetectorYN.create(det_path, "", (320, 320), 0.6, 0.3, 5000)
+            _face_recognizer = cv2.FaceRecognizerSF.create(rec_path, "")
         if need_helmet and _helmet_model is None:
-            helmet_path = MODELS / "helmet.pt"
-            if not helmet_path.exists():
-                _download(HELMET_URL, helmet_path)
-            if helmet_path.exists():
-                _helmet_model = YOLO(_model_file(helmet_path))
+            _helmet_model = YOLO(_model_file(MODELS / "helmet.pt"))
         if need_pose and _pose_model is None:
             _pose_model = YOLO(_model_file(MODELS / "yolo11n-pose.pt"))
         _model_error = ""
@@ -301,6 +289,8 @@ def _ensure_models(codes: set[int]) -> bool:
 
 
 def _model_file(path: Path) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(f"未找到模型 {path}")
     text = str(path)
     try:
         text.encode("ascii")
@@ -309,16 +299,9 @@ def _model_file(path: Path) -> str:
         cache = Path(os.environ.get("LOCALAPPDATA", ".")) / "safety-models"
         cache.mkdir(parents=True, exist_ok=True)
         target = cache / path.name
-        if path.exists() and (not target.exists() or target.stat().st_size != path.stat().st_size):
+        if not target.exists() or target.stat().st_size != path.stat().st_size:
             shutil.copyfile(path, target)
         return str(target)
-
-
-def _download(url: str, dest: Path) -> None:
-    import urllib.request
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(url, dest)
 
 
 def _person_boxes(image) -> list[dict]:

@@ -21,21 +21,34 @@ LABELS = {
     "stick_head": "导电棒尖端",
     "person": "人员",
     "glove": "绝缘手套",
+    "rod": "导电棒",
 }
 
 GLOVE_WEIGHTS = detect.MODELS / "glove.pt"
+ROD_WEIGHTS = detect.MODELS / "rod.pt"
 ELBOW_REACH = 0.5
+ROD_SIDE_RATIO = 0.18
+ROD_END_RATIO = 0.2
+ROD_HOLD_SECONDS = 0.3
+DISCHARGE_SECONDS = 5.0
+CONNECTED_PHASES = ("connect_terminal_c", "connect_terminal_b", "connect_terminal_a")
 
 _lock = threading.Lock()
 _detail_model = None
 _glove_model = None
+_rod_model = None
 _device = 0
 _running = False
 _sides = {"left": False, "right": False, "front": False, "back": False}
 _parts = {name: False for name in WIRING_PARTS}
 _start = {"terminal": False, "ground_terminal": False}
-_passed = [False, False, False, False, False]
+_passed = [False, False, False, False, False, False, False]
 _hands = {"left": False, "right": False}
+_rod_since = None
+_discharge_since = None
+_discharge_box = None
+_discharge_terminals = None
+_discharge_updated_at = None
 _end_since = None
 _end_seen_at = None
 _end_parts = {name: False for name in WIRING_PARTS}
@@ -55,13 +68,19 @@ FRONT_SECONDS = 0.4
 
 
 def _fresh() -> None:
-    global _sides, _parts, _start, _passed, _hands, _end_since, _end_seen_at, _end_parts, _layout, _layout_seen, _stable_since
+    global _sides, _parts, _start, _passed, _hands, _rod_since, _discharge_since, _discharge_box, _discharge_terminals, _discharge_updated_at
+    global _end_since, _end_seen_at, _end_parts, _layout, _layout_seen, _stable_since
     global _fixed_box, _fixed_terminals, _box_updated_at, _last_time, _front_since
     _sides = {"left": False, "right": False, "front": False, "back": False}
     _parts = {name: False for name in WIRING_PARTS}
     _start = {"terminal": False, "ground_terminal": False}
-    _passed = [False, False, False, False, False]
+    _passed = [False, False, False, False, False, False, False]
     _hands = {"left": False, "right": False}
+    _rod_since = None
+    _discharge_since = None
+    _discharge_box = None
+    _discharge_terminals = None
+    _discharge_updated_at = None
     _end_since = None
     _end_seen_at = None
     _end_parts = {name: False for name in WIRING_PARTS}
@@ -91,7 +110,9 @@ def _status(boxes: list[dict] | None = None) -> dict:
             {"name": "检查变压器", "passed": _passed[1], "sides": dict(_sides)},
             {"name": "接线", "passed": _passed[2], "parts": dict(_parts)},
             {"name": "佩戴手套", "passed": _passed[3], "hands": dict(_hands)},
-            {"name": "结束", "passed": _passed[4], "parts": dict(_end_parts)},
+            {"name": "拿起导电棒", "passed": _passed[4], "hands": dict(_hands)},
+            {"name": "放电", "passed": _passed[5]},
+            {"name": "结束", "passed": _passed[6], "parts": dict(_end_parts)},
         ],
         "boxes": boxes or [],
     }
@@ -106,6 +127,17 @@ def _ensure_glove() -> None:
     if not GLOVE_WEIGHTS.is_file():
         raise FileNotFoundError(f"未找到手套模型 {GLOVE_WEIGHTS}")
     _glove_model = YOLO(detect._model_file(GLOVE_WEIGHTS))
+
+
+def _ensure_rod() -> None:
+    global _rod_model
+    if _rod_model is not None:
+        return
+    from ultralytics import YOLO
+
+    if not ROD_WEIGHTS.is_file():
+        raise FileNotFoundError(f"未找到导电棒模型 {ROD_WEIGHTS}")
+    _rod_model = YOLO(detect._model_file(ROD_WEIGHTS))
 
 
 def _ensure_detail() -> None:
@@ -127,6 +159,7 @@ def start_process() -> dict:
         raise RuntimeError(detect._model_error or "姿态模型未就绪")
     _ensure_detail()
     _ensure_glove()
+    _ensure_rod()
     with _lock:
         _fresh()
         _running = True
@@ -148,12 +181,16 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
     boxes = [_public_box(item, width, height) for item in details]
     with _lock:
         step = _current() if _running else -1
-    poses = _poses(image) if step in (1, 3) else []
-    gloves = _detect_gloves(image) if step == 3 else []
+    poses = _poses(image) if step in (1, 3, 4, 5) else []
+    gloves = _detect_gloves(image) if step in (3, 4) else []
+    rod = _detect_rod(image) if step in (4, 5) else None
     for item in gloves:
         boxes.append(_public_box(item, width, height))
-    for pose in poses:
-        boxes.append(_public_box({**pose, "name": "person"}, width, height))
+    if rod is not None:
+        boxes.append(_public_box(_expand_rod(rod, width, height), width, height))
+    if step != 5:
+        for pose in poses:
+            boxes.append(_public_box({**pose, "name": "person"}, width, height))
     with _lock:
         if not _running:
             return _status(boxes)
@@ -177,6 +214,10 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
         elif step == 3:
             _observe_gloves(gloves, poses)
         elif step == 4:
+            _observe_rod(gloves, rod, poses, video_time, width, height)
+        elif step == 5:
+            _observe_discharge(details, rod, poses, video_time, width, height)
+        elif step == 6:
             _observe_finish(details, video_time)
         return _status(boxes)
 
@@ -198,10 +239,10 @@ def _detail_boxes(image) -> list[dict]:
     boxes = []
     if result.boxes is None:
         return boxes
-    for xyxy, cls in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy()):
+    for xyxy, cls, conf in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy(), result.boxes.conf.cpu().numpy()):
         name = str(names.get(int(cls), ""))
         x1, y1, x2, y2 = [float(value) for value in xyxy]
-        boxes.append({"name": name, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        boxes.append({"name": name, "conf": float(conf), "x1": x1, "y1": y1, "x2": x2, "y2": y2})
     return boxes
 
 
@@ -268,12 +309,14 @@ def _public_box(box: dict, width: int, height: int) -> dict:
 
 
 def _note_time(video_time: float) -> None:
-    global _last_time, _layout, _layout_seen, _stable_since, _front_since, _end_since, _end_seen_at, _end_parts
+    global _last_time, _layout, _layout_seen, _stable_since, _front_since, _rod_since, _discharge_since, _end_since, _end_seen_at, _end_parts
     if _last_time is not None and abs(video_time - _last_time) > 1.5:
         _layout = None
         _layout_seen = None
         _stable_since = None
         _front_since = None
+        _rod_since = None
+        _discharge_since = None
         _end_since = None
         _end_seen_at = None
         _end_parts = {name: False for name in WIRING_PARTS}
@@ -286,12 +329,47 @@ def _detect_gloves(image) -> list[dict]:
     boxes = []
     if result.boxes is None:
         return boxes
-    for xyxy, cls in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy()):
+    for xyxy, cls, conf in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy(), result.boxes.conf.cpu().numpy()):
         if str(names.get(int(cls), "")) != "glove":
             continue
         x1, y1, x2, y2 = [float(value) for value in xyxy]
-        boxes.append({"name": "glove", "x1": x1, "y1": y1, "x2": x2, "y2": y2})
-    return boxes
+        boxes.append({"name": "glove", "conf": float(conf), "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    boxes.sort(key=lambda item: item.get("conf", 0), reverse=True)
+    return boxes[:2]
+
+
+def _detect_rod(image) -> dict | None:
+    result = _predict(_rod_model, image, imgsz=1280, conf=0.25)
+    names = result.names or {}
+    found = []
+    if result.boxes is None:
+        return None
+    for xyxy, cls, conf in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy(), result.boxes.conf.cpu().numpy()):
+        if str(names.get(int(cls), "")) != "rod":
+            continue
+        x1, y1, x2, y2 = [float(value) for value in xyxy]
+        found.append({"name": "rod", "conf": float(conf), "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    if not found:
+        return None
+    return max(found, key=lambda item: item["conf"])
+
+
+def _expand_rod(rod: dict, frame_width: int, frame_height: int) -> dict:
+    width = max(rod["x2"] - rod["x1"], 1.0)
+    height = max(rod["y2"] - rod["y1"], 1.0)
+    long_side = max(width, height)
+    side = ROD_SIDE_RATIO * long_side
+    end = ROD_END_RATIO * long_side
+    if width >= height:
+        pad_x, pad_y = side + end, side
+    else:
+        pad_x, pad_y = side, side + end
+    grown = dict(rod)
+    grown["x1"] = max(0.0, rod["x1"] - pad_x)
+    grown["y1"] = max(0.0, rod["y1"] - pad_y)
+    grown["x2"] = min(float(frame_width - 1), rod["x2"] + pad_x)
+    grown["y2"] = min(float(frame_height - 1), rod["y2"] + pad_y)
+    return grown
 
 
 def _point_inside(point: tuple[float, float], box: dict) -> bool:
@@ -306,7 +384,7 @@ def _point_box_distance(point: tuple[float, float], box: dict) -> float:
     return math.hypot(dx, dy)
 
 
-def _worn_hands(gloves: list[dict], poses: list[dict]) -> set[tuple[int, str]]:
+def _gloved_hands(gloves: list[dict], poses: list[dict]) -> list[dict]:
     hands = []
     for person, pose in enumerate(poses):
         for side in ("left", "right"):
@@ -333,16 +411,22 @@ def _worn_hands(gloves: list[dict], poses: list[dict]) -> set[tuple[int, str]]:
             distance = _point_box_distance(hand["elbow"], box)
             if distance > ELBOW_REACH * hand["forearm"]:
                 continue
-            candidates.append((distance, hand["person"], hand["side"], index))
-    worn: set[tuple[int, str]] = set()
+            candidates.append((distance, hand, index))
+    worn_hands: list[dict] = []
+    used_people: set[tuple[int, str]] = set()
     used_boxes: set[int] = set()
-    for _distance, person, side, index in sorted(candidates):
-        key = (person, side)
-        if key in worn or index in used_boxes:
+    for _distance, hand, index in sorted(candidates, key=lambda item: item[0]):
+        key = (hand["person"], hand["side"])
+        if key in used_people or index in used_boxes:
             continue
-        worn.add(key)
+        used_people.add(key)
         used_boxes.add(index)
-    return worn
+        worn_hands.append(hand)
+    return worn_hands
+
+
+def _worn_hands(gloves: list[dict], poses: list[dict]) -> set[tuple[int, str]]:
+    return {(hand["person"], hand["side"]) for hand in _gloved_hands(gloves, poses)}
 
 
 def _observe_gloves(gloves: list[dict], poses: list[dict]) -> None:
@@ -357,6 +441,174 @@ def _observe_gloves(gloves: list[dict], poses: list[dict]) -> None:
         _passed[3] = True
 
 
+def _box_contains(outer: dict, inner: dict) -> bool:
+    return outer["x1"] <= inner["x1"] and outer["y1"] <= inner["y1"] and outer["x2"] >= inner["x2"] and outer["y2"] >= inner["y2"]
+
+
+def _holding_rod(gloves: list[dict], rod: dict | None, poses: list[dict], frame_width: int, frame_height: int) -> bool:
+    if rod is None:
+        return False
+    area = _expand_rod(rod, frame_width, frame_height)
+    by_person: dict[int, list[dict]] = {}
+    for hand in _gloved_hands(gloves, poses):
+        by_person.setdefault(hand["person"], []).append(hand)
+    for person, hands in by_person.items():
+        sides = {hand["side"] for hand in hands}
+        if sides != {"left", "right"}:
+            continue
+        if _box_contains(rod, poses[person]):
+            continue
+        if any(_point_inside(hand["wrist"], area) for hand in hands):
+            return True
+    return False
+
+
+def _observe_rod(gloves: list[dict], rod: dict | None, poses: list[dict], video_time: float, frame_width: int, frame_height: int) -> None:
+    global _hands, _rod_since, _passed
+    worn = _worn_hands(gloves, poses)
+    by_person: dict[int, set[str]] = {}
+    for person, side in worn:
+        by_person.setdefault(person, set()).add(side)
+    chosen = max(by_person.values(), key=len) if by_person else set()
+    _hands = {"left": "left" in chosen, "right": "right" in chosen}
+    if not _holding_rod(gloves, rod, poses, frame_width, frame_height):
+        _rod_since = None
+        return
+    if _rod_since is None:
+        _rod_since = video_time
+    if video_time - _rod_since >= ROD_HOLD_SECONDS:
+        _passed[4] = True
+
+
+def _center_x(box: dict) -> float:
+    return (box["x1"] + box["x2"]) / 2
+
+
+def _union_box(items: list[dict]) -> dict:
+    return {
+        "x1": min(item["x1"] for item in items),
+        "y1": min(item["y1"] for item in items),
+        "x2": max(item["x2"] for item in items),
+        "y2": max(item["y2"] for item in items),
+    }
+
+
+def _connected_region(details: list[dict]):
+    chosen = []
+    for name in CONNECTED_PHASES:
+        matches = [item for item in details if item["name"] == name]
+        if not matches:
+            return None
+        chosen.append(max(matches, key=lambda item: item.get("conf", 0)))
+    left, middle, right = chosen
+    if not _center_x(left) < _center_x(middle) < _center_x(right):
+        return None
+    return _union_box(chosen), chosen
+
+
+def _phase_visible(saved: dict, current: dict) -> bool:
+    if saved["name"] != current["name"]:
+        return False
+    saved_x = (saved["x1"] + saved["x2"]) / 2
+    saved_y = (saved["y1"] + saved["y2"]) / 2
+    current_x = (current["x1"] + current["x2"]) / 2
+    current_y = (current["y1"] + current["y2"]) / 2
+    width = max(saved["x2"] - saved["x1"], 1)
+    height = max(saved["y2"] - saved["y1"], 1)
+    return abs(saved_x - current_x) <= max(width, 24) and abs(saved_y - current_y) <= max(height * 2, 24)
+
+
+def _region_stable(previous_box: dict, current_box: dict) -> bool:
+    width = max(previous_box["x2"] - previous_box["x1"], 1)
+    height = max(previous_box["y2"] - previous_box["y1"], 1)
+    limit_x = max(width * 0.12, 12)
+    limit_y = max(height * 0.5, width * 0.06, 12)
+    for key in ("x1", "y1", "x2", "y2"):
+        limit = limit_x if key.startswith("x") else limit_y
+        if abs(previous_box[key] - current_box[key]) > limit:
+            return False
+    return True
+
+
+def _phases_occluded(details: list[dict]) -> bool:
+    if not _discharge_terminals:
+        return False
+    visible = [item for item in details if item["name"] in CONNECTED_PHASES]
+    return any(not any(_phase_visible(saved, item) for item in visible) for saved in _discharge_terminals)
+
+
+def _remember_discharge(box: dict, chosen: list[dict], video_time: float) -> None:
+    global _discharge_box, _discharge_terminals, _discharge_updated_at
+    _discharge_box = box
+    _discharge_terminals = [dict(item) for item in chosen]
+    _discharge_updated_at = video_time
+
+
+def _update_discharge_region(details: list[dict], video_time: float) -> None:
+    selected = _connected_region(details)
+    was_occluded = _phases_occluded(details)
+    if selected is None:
+        return
+    box, chosen = selected
+    due = _discharge_updated_at is None or video_time - _discharge_updated_at >= UPDATE_SECONDS
+    if _discharge_box is None or was_occluded or (_region_stable(_discharge_box, box) and due):
+        _remember_discharge(box, chosen, video_time)
+
+
+def _rod_ends(rod: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    mid_x = (rod["x1"] + rod["x2"]) / 2
+    mid_y = (rod["y1"] + rod["y2"]) / 2
+    if rod["x2"] - rod["x1"] >= rod["y2"] - rod["y1"]:
+        return (rod["x1"], mid_y), (rod["x2"], mid_y)
+    return (mid_x, rod["y1"]), (mid_x, rod["y2"])
+
+
+def _person_anchor(person: dict) -> tuple[float, float]:
+    wrist = person.get("left_wrist") or person.get("right_wrist")
+    if wrist is not None:
+        return wrist
+    return ((person["x1"] + person["x2"]) / 2, (person["y1"] + person["y2"]) / 2)
+
+
+def _nearest_person(rod: dict, poses: list[dict]) -> dict | None:
+    if not poses:
+        return None
+    center = ((rod["x1"] + rod["x2"]) / 2, (rod["y1"] + rod["y2"]) / 2)
+    return min(poses, key=lambda pose: _point_box_distance(center, pose))
+
+
+def _discharge_contact(rod_area: dict, person: dict, region: dict, terminals: list[dict]) -> bool:
+    anchor = _person_anchor(person)
+    ends = _rod_ends(rod_area)
+    near, far = sorted(ends, key=lambda point: math.hypot(point[0] - anchor[0], point[1] - anchor[1]))
+    sizes = [max(item["x2"] - item["x1"], item["y2"] - item["y1"], 1) for item in terminals]
+    reach = 0.75 * (sum(sizes) / len(sizes))
+    far_distance = _point_box_distance(far, region)
+    near_distance = _point_box_distance(near, region)
+    return far_distance <= reach and far_distance <= near_distance
+
+
+def _observe_discharge(details: list[dict], rod: dict | None, poses: list[dict], video_time: float, frame_width: int, frame_height: int) -> None:
+    global _discharge_since, _passed
+    _update_discharge_region(details, video_time)
+    area = _expand_rod(rod, frame_width, frame_height) if rod is not None else None
+    person = _nearest_person(area, poses) if area is not None else None
+    contacting = (
+        area is not None
+        and person is not None
+        and _discharge_box is not None
+        and _discharge_terminals
+        and _discharge_contact(area, person, _discharge_box, _discharge_terminals)
+    )
+    if not contacting:
+        _discharge_since = None
+        return
+    if _discharge_since is None:
+        _discharge_since = video_time
+    if video_time - _discharge_since >= DISCHARGE_SECONDS:
+        _passed[5] = True
+
+
 def _observe_finish(details: list[dict], video_time: float) -> None:
     global _end_since, _end_seen_at, _end_parts, _passed
     present = {name: any(item["name"] == name for item in details) for name in WIRING_PARTS}
@@ -368,7 +620,7 @@ def _observe_finish(details: list[dict], video_time: float) -> None:
         for name in WIRING_PARTS:
             _end_parts[name] = True
         if video_time - _end_since >= STABLE_SECONDS:
-            _passed[4] = True
+            _passed[6] = True
         return
     for name, seen in present.items():
         if seen:
