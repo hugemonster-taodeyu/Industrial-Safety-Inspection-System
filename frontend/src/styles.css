@@ -116,9 +116,7 @@ a { color: inherit; text-decoration: none; }
 .process-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .process-head h2 { margin-bottom: 0; }
 .process-stage { position: relative; background: #070b10; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-.process-stage video,
-.process-frame { width: 100%; height: auto; display: block; background: #000; }
-.process-stage video.hidden-decoder { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.process-stage video { width: 100%; height: auto; display: block; background: #000; }
 .process-overlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
 .process-overlay rect { fill: none; stroke: #7dffa8; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .step-body { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }

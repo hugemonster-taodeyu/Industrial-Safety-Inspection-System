@@ -1,14 +1,12 @@
 <template>
   <div>
     <h1 class="page-title">流程检测</h1>
-    <div class="note">选择本地视频后点击「开始」。每 25 帧检测一次，检测完才显示这一帧和它的框，然后再跳到后面的帧。</div>
     <p v-if="error" class="error">{{ error }}</p>
     <div class="live">
       <div>
         <div class="process-stage">
-          <video v-if="videoUrl" ref="videoEl" :class="{ 'hidden-decoder': stillUrl }" :src="videoUrl" controls @loadedmetadata="onMeta"></video>
-          <img v-if="stillUrl" class="process-frame" :src="stillUrl" alt="" />
-          <svg v-if="stillUrl && boxes.length" class="process-overlay" viewBox="0 0 1 1" preserveAspectRatio="none">
+          <video v-if="videoUrl" ref="videoEl" :src="videoUrl" controls @loadedmetadata="onMeta" @timeupdate="onTime" @seeked="onSeeked" @ended="onEnded"></video>
+          <svg v-if="boxes.length" class="process-overlay" viewBox="0 0 1 1" preserveAspectRatio="none">
             <rect
               v-for="(box, index) in boxes"
               :key="index"
@@ -53,7 +51,6 @@
       <aside class="panel process-panel">
         <div class="process-head">
           <h2>检测流程</h2>
-          <button class="btn" type="button" :disabled="!videoUrl || running" @click="start">{{ running ? "检测中" : "开始" }}</button>
         </div>
         <ol class="steps">
           <li v-for="(step, index) in steps" :key="step.name" class="step" :class="{ passed: step.passed, current: running && index === current }">
@@ -65,6 +62,10 @@
                 <span :class="{ on: step.sides.back }">后</span>
                 <span :class="{ on: step.sides.left }">左</span>
                 <span :class="{ on: step.sides.right }">右</span>
+              </span>
+              <span v-if="step.hands" class="side-row">
+                <span :class="{ on: step.hands.left }">左手</span>
+                <span :class="{ on: step.hands.right }">右手</span>
               </span>
               <span v-if="step.parts" class="side-row">
                 <span :class="{ on: step.parts.connect_terminal_a }">A</span>
@@ -82,7 +83,7 @@
 </template>
 
 <script setup>
-import { onUnmounted, ref } from "vue";
+import { nextTick, onUnmounted, ref } from "vue";
 import { api } from "../api";
 
 const steps = ref(blankSteps());
@@ -91,22 +92,25 @@ const boxes = ref([]);
 const videoUrl = ref("");
 const fileName = ref("");
 const videoEl = ref(null);
-const stillUrl = ref("");
 const running = ref(false);
 const error = ref("");
 const time = ref(0);
 const duration = ref(0);
 const slider = ref(0);
-let stillObjectUrl = "";
+const sampleGap = 0.1;
 let scrubbing = false;
-let pendingSeek = null;
+let sampleTimer = null;
+let sampleGeneration = 0;
+let sending = false;
+let lastSampleTime = -1;
 
 function blankSteps() {
   return [
     { name: "启动", passed: false },
     { name: "检查变压器", passed: false, sides: { front: false, back: false, left: false, right: false } },
     { name: "接线", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
-    { name: "放电", passed: false },
+    { name: "佩戴手套", passed: false, hands: { left: false, right: false } },
+    { name: "结束", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
   ];
 }
 
@@ -123,6 +127,23 @@ function onMeta() {
   duration.value = video.duration || 0;
 }
 
+function onTime() {
+  const video = videoEl.value;
+  if (!video || scrubbing) return;
+  time.value = video.currentTime;
+  if (video.duration) slider.value = Math.round((video.currentTime / video.duration) * 1000);
+}
+
+function onEnded() {
+  if (running.value) stopLoop();
+}
+
+function onSeeked() {
+  if (!running.value) return;
+  boxes.value = [];
+  lastSampleTime = -1;
+}
+
 function onSliderInput(event) {
   scrubbing = true;
   slider.value = Number(event.target.value);
@@ -136,10 +157,7 @@ function onSliderChange(event) {
   if (!video?.duration) return;
   const target = (slider.value / 1000) * video.duration;
   time.value = target;
-  if (running.value) {
-    pendingSeek = target;
-    return;
-  }
+  if (running.value) boxes.value = [];
   video.currentTime = target;
 }
 
@@ -152,28 +170,16 @@ function stateText(step, index) {
 function applyStatus(status) {
   steps.value = status.steps;
   current.value = status.current;
-  boxes.value = status.boxes || [];
-  if (status.current >= status.steps.length) running.value = false;
+  const finished = status.current >= status.steps.length;
+  boxes.value = finished ? [] : status.boxes || [];
+  if (finished) stopLoop();
 }
 
-function clearStill() {
-  if (stillObjectUrl) URL.revokeObjectURL(stillObjectUrl);
-  stillObjectUrl = "";
-  stillUrl.value = "";
-}
-
-function showStill(blob) {
-  const next = URL.createObjectURL(blob);
-  if (stillObjectUrl) URL.revokeObjectURL(stillObjectUrl);
-  stillObjectUrl = next;
-  stillUrl.value = next;
-}
-
-function onFile(event) {
+async function onFile(event) {
   const file = event.target.files?.[0];
+  event.target.value = "";
   if (!file) return;
   stopLoop();
-  clearStill();
   if (videoUrl.value) URL.revokeObjectURL(videoUrl.value);
   videoUrl.value = URL.createObjectURL(file);
   fileName.value = file.name;
@@ -183,13 +189,13 @@ function onFile(event) {
   time.value = 0;
   duration.value = 0;
   slider.value = 0;
-  pendingSeek = null;
   error.value = "";
+  await nextTick();
+  await start();
 }
 
 function clearVideo() {
   stopLoop();
-  clearStill();
   if (videoUrl.value) URL.revokeObjectURL(videoUrl.value);
   videoUrl.value = "";
   fileName.value = "";
@@ -198,22 +204,6 @@ function clearVideo() {
   time.value = 0;
   duration.value = 0;
   slider.value = 0;
-  pendingSeek = null;
-}
-
-function seek(video, time) {
-  return new Promise((resolve) => {
-    if (Math.abs(video.currentTime - time) < 0.001) {
-      resolve();
-      return;
-    }
-    const done = () => {
-      video.removeEventListener("seeked", done);
-      resolve();
-    };
-    video.addEventListener("seeked", done);
-    video.currentTime = time;
-  });
 }
 
 function capture(video) {
@@ -229,68 +219,84 @@ async function start() {
   const video = videoEl.value;
   if (!video) return;
   error.value = "";
-  try {
-    applyStatus(await api.startProcess());
-  } catch (err) {
-    error.value = err.message;
-    return;
-  }
+  boxes.value = [];
   if (video.readyState < 2) {
     await new Promise((resolve) => video.addEventListener("loadeddata", resolve, { once: true }));
   }
-  video.pause();
+  try {
+    await video.play();
+  } catch (err) {
+    error.value = err.message || "无法播放视频";
+    return;
+  }
   running.value = true;
-  await runFrames();
+  lastSampleTime = -1;
+  try {
+    applyStatus(await api.startProcess());
+  } catch (err) {
+    video.pause();
+    stopLoop();
+    error.value = err.message;
+    return;
+  }
+  beginSampling(video);
 }
 
-async function runFrames() {
-  const video = videoEl.value;
-  while (running.value && video) {
-    if (pendingSeek != null) {
-      const target = pendingSeek;
-      pendingSeek = null;
-      await seek(video, Math.min(Math.max(target, 0), Math.max(video.duration - 0.001, 0)));
-    }
-    if (!running.value) break;
-    if (video.currentTime >= video.duration - 0.001) {
-      stopLoop();
-      break;
-    }
+function beginSampling(video) {
+  stopSampling();
+  const generation = sampleGeneration;
+  sampleTimer = setInterval(() => {
+    sampleFrame(video, generation);
+  }, 30);
+}
+
+function stopSampling() {
+  sampleGeneration += 1;
+  sending = false;
+  if (sampleTimer) {
+    clearInterval(sampleTimer);
+    sampleTimer = null;
+  }
+}
+
+async function sampleFrame(video, generation) {
+  if (generation !== sampleGeneration || !running.value || sending) return;
+  if (video.ended) {
+    stopLoop();
+    return;
+  }
+  if (video.paused) return;
+  const now = video.currentTime;
+  const delta = now - lastSampleTime;
+  if (lastSampleTime >= 0 && delta >= -0.05 && delta < sampleGap) return;
+  lastSampleTime = now;
+  sending = true;
+  try {
     const blob = await capture(video);
-    if (!blob || !running.value) break;
-    if (pendingSeek != null) continue;
-    let status;
-    try {
-      status = await api.processFrame(blob);
-    } catch (err) {
-      error.value = err.message;
-      stopLoop();
-      break;
+    if (generation !== sampleGeneration || !running.value || !blob) return;
+    const status = await api.processFrame(blob, now);
+    if (generation !== sampleGeneration || !running.value) return;
+    if (Math.abs(video.currentTime - now) > 1.5) {
+      boxes.value = [];
+      return;
     }
-    if (!running.value || pendingSeek != null) continue;
-    showStill(blob);
     applyStatus(status);
-    if (!scrubbing && video.duration) {
-      time.value = video.currentTime;
-      slider.value = Math.round((video.currentTime / video.duration) * 1000);
-    }
-    if (!running.value || pendingSeek != null) continue;
-    const next = Math.min(video.duration, video.currentTime + 25 / 25);
-    if (next >= video.duration - 0.001) {
-      stopLoop();
-      break;
-    }
-    await seek(video, next);
+  } catch (err) {
+    if (generation !== sampleGeneration || !running.value) return;
+    error.value = err.message;
+    stopLoop();
+  } finally {
+    if (generation === sampleGeneration) sending = false;
   }
 }
 
 function stopLoop() {
   running.value = false;
+  stopSampling();
 }
 
 onUnmounted(() => {
   stopLoop();
-  clearStill();
   if (videoUrl.value) URL.revokeObjectURL(videoUrl.value);
 });
 </script>

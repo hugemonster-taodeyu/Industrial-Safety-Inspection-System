@@ -1,7 +1,20 @@
 async function request(url, options = {}) {
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch {
+    throw new Error("后端没有响应，请先启动后端");
+  }
   const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      if (!response.ok) throw new Error("后端没有响应，请先启动后端");
+      throw new Error("返回内容无法读取");
+    }
+  }
   if (!response.ok) {
     const detail = data?.detail;
     const message = typeof detail === "string"
@@ -43,9 +56,10 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   startProcess: () => request("/api/process/start", { method: "POST" }),
-  processFrame: (blob) => {
+  processFrame: (blob, time) => {
     const body = new FormData();
     body.append("file", blob, "frame.jpg");
+    body.append("time", String(time));
     return request("/api/process/frame", { method: "POST", body });
   },
   detections: () => request("/api/detections"),
