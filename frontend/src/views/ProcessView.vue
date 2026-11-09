@@ -6,7 +6,24 @@
       <div>
         <div class="process-stage">
           <video v-if="videoUrl" ref="videoEl" :src="videoUrl" controls @loadedmetadata="onMeta" @timeupdate="onTime" @seeked="onSeeked" @ended="onEnded"></video>
-          <svg v-if="boxes.length" class="process-overlay" viewBox="0 0 1 1" preserveAspectRatio="none">
+          <svg v-if="boxes.length || skeletons.length" class="process-overlay" viewBox="0 0 1 1" preserveAspectRatio="none">
+            <g v-for="(skeleton, index) in skeletons" :key="'skeleton-' + index" class="skeleton">
+              <line
+                v-for="(line, lineIndex) in skeleton.lines"
+                :key="'line-' + lineIndex"
+                :x1="line[0]"
+                :y1="line[1]"
+                :x2="line[2]"
+                :y2="line[3]"
+              />
+              <circle
+                v-for="(point, pointIndex) in skeleton.points"
+                :key="'point-' + pointIndex"
+                :cx="point[0]"
+                :cy="point[1]"
+                r="0.004"
+              />
+            </g>
             <rect
               v-for="(box, index) in boxes"
               :key="index"
@@ -89,6 +106,7 @@ import { api } from "../api";
 const steps = ref(blankSteps());
 const current = ref(0);
 const boxes = ref([]);
+const skeletons = ref([]);
 const videoUrl = ref("");
 const fileName = ref("");
 const videoEl = ref(null);
@@ -143,6 +161,7 @@ function onEnded() {
 function onSeeked() {
   if (!running.value) return;
   boxes.value = [];
+  skeletons.value = [];
   lastSampleTime = -1;
 }
 
@@ -159,7 +178,10 @@ function onSliderChange(event) {
   if (!video?.duration) return;
   const target = (slider.value / 1000) * video.duration;
   time.value = target;
-  if (running.value) boxes.value = [];
+  if (running.value) {
+    boxes.value = [];
+    skeletons.value = [];
+  }
   video.currentTime = target;
 }
 
@@ -174,6 +196,7 @@ function applyStatus(status) {
   current.value = status.current;
   const finished = status.current >= status.steps.length;
   boxes.value = finished ? [] : status.boxes || [];
+  skeletons.value = finished ? [] : status.skeletons || [];
   if (finished) stopLoop();
 }
 
@@ -188,6 +211,7 @@ async function onFile(event) {
   steps.value = blankSteps();
   current.value = 0;
   boxes.value = [];
+  skeletons.value = [];
   time.value = 0;
   duration.value = 0;
   slider.value = 0;
@@ -203,6 +227,7 @@ function clearVideo() {
   fileName.value = "";
   steps.value = blankSteps();
   boxes.value = [];
+  skeletons.value = [];
   time.value = 0;
   duration.value = 0;
   slider.value = 0;
@@ -222,6 +247,7 @@ async function start() {
   if (!video) return;
   error.value = "";
   boxes.value = [];
+  skeletons.value = [];
   if (video.readyState < 2) {
     await new Promise((resolve) => video.addEventListener("loadeddata", resolve, { once: true }));
   }
@@ -280,6 +306,7 @@ async function sampleFrame(video, generation) {
     if (generation !== sampleGeneration || !running.value) return;
     if (Math.abs(video.currentTime - now) > 1.5) {
       boxes.value = [];
+      skeletons.value = [];
       return;
     }
     applyStatus(status);

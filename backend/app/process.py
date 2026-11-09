@@ -26,6 +26,8 @@ LABELS = {
 
 GLOVE_WEIGHTS = detect.MODELS / "glove.pt"
 ROD_WEIGHTS = detect.MODELS / "rod.pt"
+PERSON_WEIGHTS = detect.MODELS / "yolo11n.pt"
+POSE_TASK = detect.MODELS / "pose_landmarker_heavy.task"
 ELBOW_REACH = 0.5
 ROD_SIDE_RATIO = 0.18
 ROD_END_RATIO = 0.2
@@ -37,6 +39,8 @@ _lock = threading.Lock()
 _detail_model = None
 _glove_model = None
 _rod_model = None
+_person_model = None
+_pose_landmarker = None
 _device = 0
 _running = False
 _sides = {"left": False, "right": False, "front": False, "back": False}
@@ -60,8 +64,23 @@ _fixed_terminals = None
 _box_updated_at = None
 _last_time = None
 _front_since = None
-LIMB_POINTS = (11, 12, 13, 14, 15, 16)
-LIMB_CONF = 0.55
+# MediaPipe Pose landmarks. Left and right are the person's own sides.
+_MP_SHOULDERS = (11, 12)
+_MP_ELBOWS = (13, 14)
+_MP_WRISTS = (15, 16)
+_MP_LIMBS = (23, 24, 25, 26, 27, 28)
+LIMB_CONF = 0.3
+POSE_EDGES = (
+    (0, 1), (1, 2), (2, 3), (3, 7),
+    (0, 4), (4, 5), (5, 6), (6, 8),
+    (9, 10),
+    (11, 12),
+    (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
+    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    (11, 23), (12, 24), (23, 24),
+    (23, 25), (24, 26), (25, 27), (26, 28),
+    (27, 29), (28, 30), (29, 31), (30, 32), (27, 31), (28, 32),
+)
 STABLE_SECONDS = 10
 UPDATE_SECONDS = 5
 FRONT_SECONDS = 0.4
@@ -101,7 +120,7 @@ def _current() -> int:
     return len(_passed)
 
 
-def _status(boxes: list[dict] | None = None) -> dict:
+def _status(boxes: list[dict] | None = None, skeletons: list[dict] | None = None) -> dict:
     return {
         "running": _running,
         "current": _current(),
@@ -115,6 +134,7 @@ def _status(boxes: list[dict] | None = None) -> dict:
             {"name": "结束", "passed": _passed[6], "parts": dict(_end_parts)},
         ],
         "boxes": boxes or [],
+        "skeletons": skeletons or [],
     }
 
 
@@ -154,9 +174,8 @@ def _ensure_detail() -> None:
 
 def start_process() -> dict:
     global _running
-    detect._ensure_models({4})
-    if detect._pose_model is None:
-        raise RuntimeError(detect._model_error or "姿态模型未就绪")
+    _ensure_person()
+    _ensure_pose()
     _ensure_detail()
     _ensure_glove()
     _ensure_rod()
@@ -191,9 +210,10 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
     if step != 5:
         for pose in poses:
             boxes.append(_public_box({**pose, "name": "person"}, width, height))
+    skeletons = [item for item in (_public_skeleton(pose, width, height) for pose in poses) if item]
     with _lock:
         if not _running:
-            return _status(boxes)
+            return _status(boxes, skeletons)
         _note_time(video_time)
         step = _current()
         if step == 0:
@@ -219,7 +239,7 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
             _observe_discharge(details, rod, poses, video_time, width, height)
         elif step == 6:
             _observe_finish(details, video_time)
-        return _status(boxes)
+        return _status(boxes, skeletons)
 
 
 def _predict(model, image, **kwargs):
@@ -246,55 +266,127 @@ def _detail_boxes(image) -> list[dict]:
     return boxes
 
 
+def _ensure_person() -> None:
+    global _person_model
+    if _person_model is not None:
+        return
+    from ultralytics import YOLO
+
+    if not PERSON_WEIGHTS.is_file():
+        raise FileNotFoundError(f"未找到人体模型 {PERSON_WEIGHTS}")
+    _person_model = YOLO(detect._model_file(PERSON_WEIGHTS))
+
+
+def _ensure_pose() -> None:
+    global _pose_landmarker
+    if _pose_landmarker is not None:
+        return
+    import mediapipe as mp
+
+    if not POSE_TASK.is_file():
+        raise FileNotFoundError(f"未找到姿态模型 {POSE_TASK}")
+    options = mp.tasks.vision.PoseLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=detect._model_file(POSE_TASK)),
+        running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+    )
+    _pose_landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
+
+
 def _poses(image) -> list[dict]:
-    result = _predict(detect._pose_model, image, conf=0.4)
+    result = _predict(_person_model, image, classes=[0], conf=0.4)
     poses = []
-    if result.keypoints is None or result.boxes is None:
+    if result.boxes is None:
         return poses
-    points_all = result.keypoints.xy.cpu().numpy()
-    conf_tensor = result.keypoints.conf
-    scores_all = conf_tensor.cpu().numpy() if conf_tensor is not None else None
-    for index, box in enumerate(result.boxes.xyxy.cpu().numpy()):
-        points = points_all[index]
-        scores = scores_all[index] if scores_all is not None else [1.0] * len(points)
+    height, width = image.shape[:2]
+    for box in result.boxes.xyxy.cpu().numpy():
         x1, y1, x2, y2 = [float(value) for value in box]
-        left_shoulder = detect._keypoint(points, scores, 5)
-        right_shoulder = detect._keypoint(points, scores, 6)
-        shoulder = None
-        if left_shoulder is not None and right_shoulder is not None:
-            shoulder = (
-                (left_shoulder[0] + right_shoulder[0]) / 2,
-                (left_shoulder[1] + right_shoulder[1]) / 2,
-            )
-        limb_points = []
-        for point_index in LIMB_POINTS:
-            point = _pose_point(points, scores, point_index, LIMB_CONF)
-            if point is not None:
-                limb_points.append(point)
-        poses.append(
-            {
-                "x1": x1,
-                "y1": y1,
-                "x2": x2,
-                "y2": y2,
-                "shoulder": shoulder,
-                "limb_points": limb_points,
-                "left_elbow": detect._keypoint(points, scores, 7),
-                "right_elbow": detect._keypoint(points, scores, 8),
-                "left_wrist": detect._keypoint(points, scores, 9),
-                "right_wrist": detect._keypoint(points, scores, 10),
-            }
-        )
+        person = {
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "shoulder": None,
+            "limb_points": [],
+            "left_elbow": None,
+            "right_elbow": None,
+            "left_wrist": None,
+            "right_wrist": None,
+            "skeleton_points": {},
+        }
+        _read_pose(image, person, width, height)
+        poses.append(person)
     return poses
 
 
-def _pose_point(points, scores, index: int, minimum: float):
-    if index >= len(points) or float(scores[index]) < minimum:
+def _read_pose(image, person: dict, frame_width: int, frame_height: int) -> None:
+    x1 = max(0, int(person["x1"]))
+    y1 = max(0, int(person["y1"]))
+    x2 = min(frame_width, int(math.ceil(person["x2"])))
+    y2 = min(frame_height, int(math.ceil(person["y2"])))
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return
+    import cv2
+    import mediapipe as mp
+
+    crop = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+    if not crop.flags["C_CONTIGUOUS"]:
+        crop = crop.copy()
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop)
+    result = _pose_landmarker.detect(mp_image)
+    if not result.pose_landmarks:
+        return
+    landmarks = result.pose_landmarks[0]
+    crop_box = (float(x1), float(y1), float(x2), float(y2))
+    left_shoulder = _landmark_point(landmarks, _MP_SHOULDERS[0], crop_box, detect.POSE_POINT_CONF)
+    right_shoulder = _landmark_point(landmarks, _MP_SHOULDERS[1], crop_box, detect.POSE_POINT_CONF)
+    if left_shoulder is not None and right_shoulder is not None:
+        person["shoulder"] = (
+            (left_shoulder[0] + right_shoulder[0]) / 2,
+            (left_shoulder[1] + right_shoulder[1]) / 2,
+        )
+    person["left_elbow"] = _landmark_point(landmarks, _MP_ELBOWS[0], crop_box, detect.POSE_POINT_CONF)
+    person["right_elbow"] = _landmark_point(landmarks, _MP_ELBOWS[1], crop_box, detect.POSE_POINT_CONF)
+    person["left_wrist"] = _landmark_point(landmarks, _MP_WRISTS[0], crop_box, detect.POSE_POINT_CONF)
+    person["right_wrist"] = _landmark_point(landmarks, _MP_WRISTS[1], crop_box, detect.POSE_POINT_CONF)
+    person["limb_points"] = [
+        point
+        for index in _MP_LIMBS
+        if (point := _landmark_point(landmarks, index, crop_box, LIMB_CONF)) is not None
+    ]
+    person["skeleton_points"] = {
+        index: point
+        for index in range(len(landmarks))
+        if (point := _landmark_point(landmarks, index, crop_box, detect.POSE_POINT_CONF)) is not None
+    }
+
+
+def _public_skeleton(person: dict, width: int, height: int) -> dict | None:
+    points = person.get("skeleton_points") or {}
+    if len(points) < 2:
         return None
-    x, y = float(points[index][0]), float(points[index][1])
-    if x <= 0 and y <= 0:
+    lines = []
+    for start, end in POSE_EDGES:
+        if start not in points or end not in points:
+            continue
+        ax, ay = points[start]
+        bx, by = points[end]
+        lines.append([ax / width, ay / height, bx / width, by / height])
+    dots = [[x / width, y / height] for x, y in points.values()]
+    return {"lines": lines, "points": dots}
+
+
+def _landmark_point(landmarks, index: int, crop_box: tuple[float, float, float, float], minimum: float):
+    if index >= len(landmarks):
         return None
-    return x, y
+    mark = landmarks[index]
+    score = mark.visibility if mark.visibility is not None else getattr(mark, "presence", None)
+    if score is not None and float(score) < minimum:
+        return None
+    x1, y1, x2, y2 = crop_box
+    return x1 + float(mark.x) * (x2 - x1), y1 + float(mark.y) * (y2 - y1)
 
 
 def _public_box(box: dict, width: int, height: int) -> dict:
