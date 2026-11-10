@@ -22,10 +22,14 @@ LABELS = {
     "person": "人员",
     "glove": "绝缘手套",
     "rod": "导电棒",
+    "connect": "铜线已连接",
+    "disconnect": "铜线未连接",
+    "copper_wire": "铜线",
 }
 
 GLOVE_WEIGHTS = detect.MODELS / "glove.pt"
 ROD_WEIGHTS = detect.MODELS / "rod.pt"
+COPPER_WEIGHTS = detect.MODELS / "copper.pt"
 PERSON_WEIGHTS = detect.MODELS / "yolo11n.pt"
 POSE_TASK = detect.MODELS / "pose_landmarker_heavy.task"
 ELBOW_REACH = 0.5
@@ -33,12 +37,14 @@ ROD_SIDE_RATIO = 0.18
 ROD_END_RATIO = 0.2
 ROD_HOLD_SECONDS = 0.3
 DISCHARGE_SECONDS = 5.0
+COPPER_SECONDS = 5.0
 CONNECTED_PHASES = ("connect_terminal_c", "connect_terminal_b", "connect_terminal_a")
 
 _lock = threading.Lock()
 _detail_model = None
 _glove_model = None
 _rod_model = None
+_copper_model = None
 _person_model = None
 _pose_landmarker = None
 _device = 0
@@ -46,10 +52,11 @@ _running = False
 _sides = {"left": False, "right": False, "front": False, "back": False}
 _parts = {name: False for name in WIRING_PARTS}
 _start = {"terminal": False, "ground_terminal": False}
-_passed = [False, False, False, False, False, False, False]
+_passed = [False, False, False, False, False, False, False, False]
 _hands = {"left": False, "right": False}
 _rod_since = None
 _discharge_since = None
+_copper_since = None
 _discharge_box = None
 _discharge_terminals = None
 _discharge_updated_at = None
@@ -70,33 +77,23 @@ _MP_ELBOWS = (13, 14)
 _MP_WRISTS = (15, 16)
 _MP_LIMBS = (23, 24, 25, 26, 27, 28)
 LIMB_CONF = 0.3
-POSE_EDGES = (
-    (0, 1), (1, 2), (2, 3), (3, 7),
-    (0, 4), (4, 5), (5, 6), (6, 8),
-    (9, 10),
-    (11, 12),
-    (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
-    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
-    (11, 23), (12, 24), (23, 24),
-    (23, 25), (24, 26), (25, 27), (26, 28),
-    (27, 29), (28, 30), (29, 31), (30, 32), (27, 31), (28, 32),
-)
 STABLE_SECONDS = 10
 UPDATE_SECONDS = 5
 FRONT_SECONDS = 0.4
 
 
 def _fresh() -> None:
-    global _sides, _parts, _start, _passed, _hands, _rod_since, _discharge_since, _discharge_box, _discharge_terminals, _discharge_updated_at
+    global _sides, _parts, _start, _passed, _hands, _rod_since, _copper_since, _discharge_since, _discharge_box, _discharge_terminals, _discharge_updated_at
     global _end_since, _end_seen_at, _end_parts, _layout, _layout_seen, _stable_since
     global _fixed_box, _fixed_terminals, _box_updated_at, _last_time, _front_since
     _sides = {"left": False, "right": False, "front": False, "back": False}
     _parts = {name: False for name in WIRING_PARTS}
     _start = {"terminal": False, "ground_terminal": False}
-    _passed = [False, False, False, False, False, False, False]
+    _passed = [False, False, False, False, False, False, False, False]
     _hands = {"left": False, "right": False}
     _rod_since = None
     _discharge_since = None
+    _copper_since = None
     _discharge_box = None
     _discharge_terminals = None
     _discharge_updated_at = None
@@ -120,7 +117,7 @@ def _current() -> int:
     return len(_passed)
 
 
-def _status(boxes: list[dict] | None = None, skeletons: list[dict] | None = None) -> dict:
+def _status(boxes: list[dict] | None = None) -> dict:
     return {
         "running": _running,
         "current": _current(),
@@ -131,10 +128,10 @@ def _status(boxes: list[dict] | None = None, skeletons: list[dict] | None = None
             {"name": "佩戴手套", "passed": _passed[3], "hands": dict(_hands)},
             {"name": "拿起导电棒", "passed": _passed[4], "hands": dict(_hands)},
             {"name": "放电", "passed": _passed[5]},
-            {"name": "结束", "passed": _passed[6], "parts": dict(_end_parts)},
+            {"name": "铜线检测", "passed": _passed[6]},
+            {"name": "结束", "passed": _passed[7], "parts": dict(_end_parts)},
         ],
         "boxes": boxes or [],
-        "skeletons": skeletons or [],
     }
 
 
@@ -147,6 +144,17 @@ def _ensure_glove() -> None:
     if not GLOVE_WEIGHTS.is_file():
         raise FileNotFoundError(f"未找到手套模型 {GLOVE_WEIGHTS}")
     _glove_model = YOLO(detect._model_file(GLOVE_WEIGHTS))
+
+
+def _ensure_copper() -> None:
+    global _copper_model
+    if _copper_model is not None:
+        return
+    from ultralytics import YOLO
+
+    if not COPPER_WEIGHTS.is_file():
+        raise FileNotFoundError(f"未找到铜线模型 {COPPER_WEIGHTS}")
+    _copper_model = YOLO(detect._model_file(COPPER_WEIGHTS))
 
 
 def _ensure_rod() -> None:
@@ -179,6 +187,7 @@ def start_process() -> dict:
     _ensure_detail()
     _ensure_glove()
     _ensure_rod()
+    _ensure_copper()
     with _lock:
         _fresh()
         _running = True
@@ -203,17 +212,19 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
     poses = _poses(image) if step in (1, 3, 4, 5) else []
     gloves = _detect_gloves(image) if step in (3, 4) else []
     rod = _detect_rod(image) if step in (4, 5) else None
+    copper = _detect_copper(image) if step == 6 else []
     for item in gloves:
         boxes.append(_public_box(item, width, height))
     if rod is not None:
         boxes.append(_public_box(_expand_rod(rod, width, height), width, height))
+    for item in copper:
+        boxes.append(_public_box(item, width, height))
     if step != 5:
         for pose in poses:
             boxes.append(_public_box({**pose, "name": "person"}, width, height))
-    skeletons = [item for item in (_public_skeleton(pose, width, height) for pose in poses) if item]
     with _lock:
         if not _running:
-            return _status(boxes, skeletons)
+            return _status(boxes)
         _note_time(video_time)
         step = _current()
         if step == 0:
@@ -238,8 +249,10 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
         elif step == 5:
             _observe_discharge(details, rod, poses, video_time, width, height)
         elif step == 6:
+            _observe_copper(copper, video_time)
+        elif step == 7:
             _observe_finish(details, video_time)
-        return _status(boxes, skeletons)
+        return _status(boxes)
 
 
 def _predict(model, image, **kwargs):
@@ -314,7 +327,6 @@ def _poses(image) -> list[dict]:
             "right_elbow": None,
             "left_wrist": None,
             "right_wrist": None,
-            "skeleton_points": {},
         }
         _read_pose(image, person, width, height)
         poses.append(person)
@@ -356,26 +368,6 @@ def _read_pose(image, person: dict, frame_width: int, frame_height: int) -> None
         for index in _MP_LIMBS
         if (point := _landmark_point(landmarks, index, crop_box, LIMB_CONF)) is not None
     ]
-    person["skeleton_points"] = {
-        index: point
-        for index in range(len(landmarks))
-        if (point := _landmark_point(landmarks, index, crop_box, detect.POSE_POINT_CONF)) is not None
-    }
-
-
-def _public_skeleton(person: dict, width: int, height: int) -> dict | None:
-    points = person.get("skeleton_points") or {}
-    if len(points) < 2:
-        return None
-    lines = []
-    for start, end in POSE_EDGES:
-        if start not in points or end not in points:
-            continue
-        ax, ay = points[start]
-        bx, by = points[end]
-        lines.append([ax / width, ay / height, bx / width, by / height])
-    dots = [[x / width, y / height] for x, y in points.values()]
-    return {"lines": lines, "points": dots}
 
 
 def _landmark_point(landmarks, index: int, crop_box: tuple[float, float, float, float], minimum: float):
@@ -401,13 +393,14 @@ def _public_box(box: dict, width: int, height: int) -> dict:
 
 
 def _note_time(video_time: float) -> None:
-    global _last_time, _layout, _layout_seen, _stable_since, _front_since, _rod_since, _discharge_since, _end_since, _end_seen_at, _end_parts
+    global _last_time, _layout, _layout_seen, _stable_since, _front_since, _rod_since, _copper_since, _discharge_since, _end_since, _end_seen_at, _end_parts
     if _last_time is not None and abs(video_time - _last_time) > 1.5:
         _layout = None
         _layout_seen = None
         _stable_since = None
         _front_since = None
         _rod_since = None
+        _copper_since = None
         _discharge_since = None
         _end_since = None
         _end_seen_at = None
@@ -444,6 +437,33 @@ def _detect_rod(image) -> dict | None:
     if not found:
         return None
     return max(found, key=lambda item: item["conf"])
+
+
+def _detect_copper(image) -> list[dict]:
+    result = _predict(_copper_model, image, imgsz=1280, conf=0.25)
+    names = result.names or {}
+    boxes = []
+    if result.boxes is None:
+        return boxes
+    for xyxy, cls, conf in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy(), result.boxes.conf.cpu().numpy()):
+        name = str(names.get(int(cls), ""))
+        if name not in {"connect", "disconnect", "copper_wire"}:
+            continue
+        x1, y1, x2, y2 = [float(value) for value in xyxy]
+        boxes.append({"name": name, "conf": float(conf), "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    return boxes
+
+
+def _observe_copper(items: list[dict], video_time: float) -> None:
+    global _copper_since, _passed
+    connected = any(item["name"] == "connect" for item in items)
+    if not connected:
+        _copper_since = None
+        return
+    if _copper_since is None:
+        _copper_since = video_time
+    if video_time - _copper_since >= COPPER_SECONDS:
+        _passed[6] = True
 
 
 def _expand_rod(rod: dict, frame_width: int, frame_height: int) -> dict:
@@ -712,7 +732,7 @@ def _observe_finish(details: list[dict], video_time: float) -> None:
         for name in WIRING_PARTS:
             _end_parts[name] = True
         if video_time - _end_since >= STABLE_SECONDS:
-            _passed[6] = True
+            _passed[7] = True
         return
     for name, seen in present.items():
         if seen:

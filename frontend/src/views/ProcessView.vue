@@ -6,38 +6,15 @@
       <div>
         <div class="process-stage">
           <video v-if="videoUrl" ref="videoEl" :src="videoUrl" controls @loadedmetadata="onMeta" @timeupdate="onTime" @seeked="onSeeked" @ended="onEnded"></video>
-          <svg v-if="boxes.length || skeletons.length" class="process-overlay" viewBox="0 0 1 1" preserveAspectRatio="none">
-            <g v-for="(skeleton, index) in skeletons" :key="'skeleton-' + index" class="skeleton">
-              <line
-                v-for="(line, lineIndex) in skeleton.lines"
-                :key="'line-' + lineIndex"
-                :x1="line[0]"
-                :y1="line[1]"
-                :x2="line[2]"
-                :y2="line[3]"
-              />
-              <circle
-                v-for="(point, pointIndex) in skeleton.points"
-                :key="'point-' + pointIndex"
-                :cx="point[0]"
-                :cy="point[1]"
-                r="0.004"
-              />
-            </g>
-            <rect
-              v-for="(box, index) in boxes"
-              :key="index"
-              :x="box.x1"
-              :y="box.y1"
-              :width="Math.max(box.x2 - box.x1, 0)"
-              :height="Math.max(box.y2 - box.y1, 0)"
-            />
-          </svg>
           <div v-if="!videoUrl" class="video-wrap">
             <div class="video-empty">
               <p>还没有选择视频</p>
             </div>
           </div>
+          <div v-if="boxes.length" class="process-overlay">
+            <div v-for="(box, index) in boxes" :key="index" class="process-box" :style="boxStyle(box)"></div>
+          </div>
+          <p v-if="notice" class="process-notice">{{ notice }}</p>
         </div>
         <div class="camera-bar">
           <span class="time">{{ clock(time) }}</span>
@@ -106,12 +83,12 @@ import { api } from "../api";
 const steps = ref(blankSteps());
 const current = ref(0);
 const boxes = ref([]);
-const skeletons = ref([]);
 const videoUrl = ref("");
 const fileName = ref("");
 const videoEl = ref(null);
 const running = ref(false);
 const error = ref("");
+const notice = ref("");
 const time = ref(0);
 const duration = ref(0);
 const slider = ref(0);
@@ -121,6 +98,8 @@ let sampleTimer = null;
 let sampleGeneration = 0;
 let sending = false;
 let lastSampleTime = -1;
+let seenPassed = [];
+let noticeTimer = null;
 
 function blankSteps() {
   return [
@@ -130,8 +109,18 @@ function blankSteps() {
     { name: "佩戴手套", passed: false, hands: { left: false, right: false } },
     { name: "拿起导电棒", passed: false, hands: { left: false, right: false } },
     { name: "放电", passed: false },
+    { name: "铜线检测", passed: false },
     { name: "结束", passed: false, parts: { connect_terminal_a: false, connect_terminal_b: false, connect_terminal_c: false, connect_ground_terminal: false } },
   ];
+}
+
+function boxStyle(box) {
+  return {
+    left: `${box.x1 * 100}%`,
+    top: `${box.y1 * 100}%`,
+    width: `${Math.max(box.x2 - box.x1, 0) * 100}%`,
+    height: `${Math.max(box.y2 - box.y1, 0) * 100}%`,
+  };
 }
 
 function clock(seconds) {
@@ -161,7 +150,6 @@ function onEnded() {
 function onSeeked() {
   if (!running.value) return;
   boxes.value = [];
-  skeletons.value = [];
   lastSampleTime = -1;
 }
 
@@ -180,7 +168,6 @@ function onSliderChange(event) {
   time.value = target;
   if (running.value) {
     boxes.value = [];
-    skeletons.value = [];
   }
   video.currentTime = target;
 }
@@ -191,12 +178,39 @@ function stateText(step, index) {
   return "待检测";
 }
 
+function clearNotice() {
+  notice.value = "";
+  if (noticeTimer) {
+    clearTimeout(noticeTimer);
+    noticeTimer = null;
+  }
+}
+
+function showNotice(text) {
+  notice.value = text;
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => {
+    notice.value = "";
+    noticeTimer = null;
+  }, 5000);
+}
+
+function noteProgress(nextSteps) {
+  nextSteps.forEach((step, index) => {
+    if (!step.passed || seenPassed[index]) return;
+    const following = nextSteps[index + 1];
+    showNotice(following ? `${step.name}流程已完成，进入${following.name}流程` : `${step.name}流程已完成`);
+  });
+  seenPassed = nextSteps.map((step) => !!step.passed);
+}
+
 function applyStatus(status) {
-  steps.value = status.steps;
+  const nextSteps = status.steps || [];
+  noteProgress(nextSteps);
+  steps.value = nextSteps;
   current.value = status.current;
-  const finished = status.current >= status.steps.length;
+  const finished = status.current >= nextSteps.length;
   boxes.value = finished ? [] : status.boxes || [];
-  skeletons.value = finished ? [] : status.skeletons || [];
   if (finished) stopLoop();
 }
 
@@ -211,7 +225,8 @@ async function onFile(event) {
   steps.value = blankSteps();
   current.value = 0;
   boxes.value = [];
-  skeletons.value = [];
+  seenPassed = [];
+  clearNotice();
   time.value = 0;
   duration.value = 0;
   slider.value = 0;
@@ -227,7 +242,8 @@ function clearVideo() {
   fileName.value = "";
   steps.value = blankSteps();
   boxes.value = [];
-  skeletons.value = [];
+  seenPassed = [];
+  clearNotice();
   time.value = 0;
   duration.value = 0;
   slider.value = 0;
@@ -247,7 +263,6 @@ async function start() {
   if (!video) return;
   error.value = "";
   boxes.value = [];
-  skeletons.value = [];
   if (video.readyState < 2) {
     await new Promise((resolve) => video.addEventListener("loadeddata", resolve, { once: true }));
   }
@@ -306,7 +321,6 @@ async function sampleFrame(video, generation) {
     if (generation !== sampleGeneration || !running.value) return;
     if (Math.abs(video.currentTime - now) > 1.5) {
       boxes.value = [];
-      skeletons.value = [];
       return;
     }
     applyStatus(status);
@@ -326,6 +340,7 @@ function stopLoop() {
 
 onUnmounted(() => {
   stopLoop();
+  clearNotice();
   if (videoUrl.value) URL.revokeObjectURL(videoUrl.value);
 });
 </script>
