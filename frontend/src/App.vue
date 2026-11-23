@@ -45,7 +45,7 @@
 
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { api } from "./api";
+import { api, PROCESS_ALARM_CODE } from "./api";
 
 const stage = ref("");
 const stages = ref([]);
@@ -122,7 +122,9 @@ async function onSound(event) {
 async function pollAlarms() {
   const records = await api.alarms().catch(() => null);
   if (!records) return;
-  const maxId = records.reduce((max, item) => (!item.simulated && item.id > max ? item.id : max), 0);
+  const maxId = records
+    .filter((item) => !item.simulated && item.code !== PROCESS_ALARM_CODE)
+    .reduce((max, item) => Math.max(max, item.id), 0);
   if (alarmBaseline && soundEnabled.value && maxId > seenAlarmId) beep();
   seenAlarmId = Math.max(seenAlarmId, maxId);
   alarmBaseline = true;

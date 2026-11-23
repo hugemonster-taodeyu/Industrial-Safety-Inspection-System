@@ -7,6 +7,7 @@
         <option v-for="item in detections" :key="item.code" :value="item.code">
           {{ item.code }}. {{ item.title }}
         </option>
+        <option :value="PROCESS_ALARM_CODE">流程检测</option>
       </select>
     </label>
     <table>
@@ -44,7 +45,7 @@
 
 <script setup>
 import { onMounted, ref } from "vue";
-import { api } from "../api";
+import { api, PROCESS_ALARM_CODE } from "../api";
 
 const detections = ref([]);
 const alarms = ref([]);

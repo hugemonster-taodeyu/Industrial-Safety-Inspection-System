@@ -858,12 +858,28 @@ def _embed_file(path: str):
     return vector / norm
 
 
+def alarm_settings() -> tuple[int, int, int]:
+    return (
+        max(1, _setting_int("alarm_window_seconds", 3)),
+        max(1, _setting_int("alarm_count", 3)),
+        max(1, _setting_int("alarm_gap_seconds", 20)),
+    )
+
+
+def record_alarm(code: int, title: str, detail: str, person: str = "") -> int:
+    return execute(
+        """
+        INSERT INTO alarms (code, title, detail, person, stage, simulated)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        (code, title, detail, person, _stage()),
+    )
+
+
 def _raise_alarm(code: int, title: str, detail: str, person: str, image=None) -> None:
     key = (code, person)
     now = time.time()
-    window = max(1, _setting_int("alarm_window_seconds", 3))
-    need = max(1, _setting_int("alarm_count", 3))
-    gap = max(1, _setting_int("alarm_gap_seconds", 20))
+    window, need, gap = alarm_settings()
     with _alarm_lock:
         stamps = [stamp for stamp in _alarm_hits.get(key, []) if now - stamp <= window]
         stamps.append(now)
@@ -875,13 +891,7 @@ def _raise_alarm(code: int, title: str, detail: str, person: str, image=None) ->
             return
         _last_alarm[key] = now
         _alarm_hits[key] = []
-    alarm_id = execute(
-        """
-        INSERT INTO alarms (code, title, detail, person, stage, simulated)
-        VALUES (?, ?, ?, ?, ?, 0)
-        """,
-        (code, title, detail, person, _stage()),
-    )
+    alarm_id = record_alarm(code, title, detail, person)
     if image is None or not alarm_id:
         return
     path = _save_snapshot(alarm_id, image)

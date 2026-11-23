@@ -1,3 +1,5 @@
+export const PROCESS_ALARM_CODE = 8;
+
 async function request(url, options = {}) {
   let response;
   try {

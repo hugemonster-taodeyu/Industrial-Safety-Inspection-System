@@ -96,7 +96,7 @@
 <script setup>
 defineOptions({ name: "LiveView" });
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { api } from "../api";
+import { api, PROCESS_ALARM_CODE } from "../api";
 
 const props = defineProps({
   stage: { type: String, default: "" },
@@ -206,7 +206,7 @@ async function refresh() {
     api.presence().catch(() => presence.value),
   ]);
   if (items) detections.value = items;
-  if (records) alarms.value = records;
+  if (records) alarms.value = records.filter((item) => item.code !== PROCESS_ALARM_CODE);
   if (presenceState) presence.value = presenceState;
   if (!camera) return;
   cameraOn.value = camera.connected;

@@ -1,7 +1,7 @@
 <template>
   <div>
     <h1 class="page-title">报警设置</h1>
-    <div class="note">五项检测共用下面三个参数。在累计时间内达到累计次数后才写入报警，同一对象在报警间隔内不会再次报警。</div>
+    <div class="note">实时监控和流程检测共用这三个参数。在累计时间内达到累计次数才记录报警，同类报警在间隔内只记录一次。流程检测按当前步骤和提前动作累计，使用视频时间。</div>
     <form class="settings-form" @submit.prevent="save">
       <label class="field">累计时间（秒）
         <input v-model.number="form.alarm_window_seconds" type="number" min="1" max="120" required />

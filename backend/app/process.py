@@ -35,7 +35,8 @@ ROD_END_RATIO = 0.2
 ROD_HOLD_SECONDS = 0.3
 DISCHARGE_SECONDS = 5.0
 COPPER_SECONDS = 5.0
-WARN_SECONDS = 0.5
+WARNING_CLEAR_SECONDS = 0.5
+PROCESS_ALARM_CODE = 8
 CONNECTED_PHASES = ("connect_terminal_c", "connect_terminal_b", "connect_terminal_a")
 DETAIL_NAMES = {
     "terminal",
@@ -55,6 +56,7 @@ _person_model = None
 _pose_landmarker = None
 _device = 0
 _running = False
+_run_id = 0
 _sides = {"left": False, "right": False, "front": False, "back": False}
 _parts = {name: False for name in WIRING_PARTS}
 _start = {"terminal": False, "ground_terminal": False}
@@ -78,9 +80,10 @@ _box_updated_at = None
 _last_time = None
 _front_since = None
 _warning = ""
-_warn_action = None
-_warn_since = None
+_warning_key: tuple[int, str] | None = None
 _warn_clear_since = None
+_warning_hits: dict[tuple[int, str], list[float]] = {}
+_recorded_warning_times: dict[tuple[int, str], list[float]] = {}
 # MediaPipe Pose landmarks. Left and right are the person's own sides.
 _MP_SHOULDERS = (11, 12)
 _MP_ELBOWS = (13, 14)
@@ -96,7 +99,6 @@ def _fresh() -> None:
     global _sides, _parts, _start, _passed, _hands, _rod_since, _copper_since, _discharge_since, _discharge_box, _discharge_terminals, _discharge_updated_at
     global _end_since, _end_seen_at, _end_parts, _layout, _layout_seen, _stable_since
     global _fixed_box, _fixed_terminals, _box_updated_at, _last_time, _front_since
-    global _warning, _warn_action, _warn_since, _warn_clear_since
     _sides = {"left": False, "right": False, "front": False, "back": False}
     _parts = {name: False for name in WIRING_PARTS}
     _start = {"terminal": False, "ground_terminal": False}
@@ -119,10 +121,9 @@ def _fresh() -> None:
     _box_updated_at = None
     _last_time = None
     _front_since = None
-    _warning = ""
-    _warn_action = None
-    _warn_since = None
-    _warn_clear_since = None
+    _clear_warning()
+    _warning_hits.clear()
+    _recorded_warning_times.clear()
 
 
 def _current() -> int:
@@ -163,12 +164,13 @@ def _ensure_scene() -> None:
 
 
 def start_process() -> dict:
-    global _running
+    global _running, _run_id
     _ensure_person()
     _ensure_pose()
     _ensure_scene()
     with _lock:
         _fresh()
+        _run_id += 1
         _running = True
         return _status()
 
@@ -181,14 +183,15 @@ def stop_process() -> dict:
 
 
 def analyze_process_frame(image, video_time: float = 0) -> dict:
-    if not _running:
-        return _status()
+    with _lock:
+        if not _running:
+            return _status()
+        run_id = _run_id
+        step = _current()
     height, width = image.shape[:2]
     found = _scene_boxes(image)
     details = [item for item in found if item["name"] in DETAIL_NAMES]
     boxes = [_public_box(item, width, height) for item in details]
-    with _lock:
-        step = _current() if _running else -1
     poses = _poses(image) if step <= 5 else []
     gloves = _pick_gloves(found) if step <= 4 else []
     rod = _pick_rod(found) if step <= 5 else None
@@ -205,8 +208,8 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
         for pose in poses:
             boxes.append(_public_box({**pose, "name": "person"}, width, height))
     with _lock:
-        if not _running:
-            return _status(boxes)
+        if not _running or run_id != _run_id:
+            return _status()
         _note_time(video_time)
         step = _current()
         if step == 0:
@@ -380,8 +383,8 @@ def _public_box(box: dict, width: int, height: int) -> dict:
 
 def _note_time(video_time: float) -> None:
     global _last_time, _layout, _layout_seen, _stable_since, _front_since, _rod_since, _copper_since, _discharge_since, _end_since, _end_seen_at, _end_parts
-    global _warning, _warn_action, _warn_since, _warn_clear_since
-    if _last_time is not None and abs(video_time - _last_time) > 1.5:
+    delta = 0 if _last_time is None else video_time - _last_time
+    if abs(delta) > 1.5:
         _layout = None
         _layout_seen = None
         _stable_since = None
@@ -392,10 +395,9 @@ def _note_time(video_time: float) -> None:
         _end_since = None
         _end_seen_at = None
         _end_parts = {name: False for name in WIRING_PARTS}
-        _warning = ""
-        _warn_action = None
-        _warn_since = None
-        _warn_clear_since = None
+    if abs(delta) > 1.5 or delta < -0.05:
+        _clear_warning()
+        _warning_hits.clear()
     _last_time = video_time
 
 
@@ -433,27 +435,48 @@ def _early_action(step: int, details: list[dict], gloves: list[dict], rod: dict 
     return actions[-1] if actions else None
 
 
+def _clear_warning() -> None:
+    global _warning, _warning_key, _warn_clear_since
+    _warning = ""
+    _warning_key = None
+    _warn_clear_since = None
+
+
 def _update_warning(step: int, action: str | None, video_time: float) -> None:
-    global _warning, _warn_action, _warn_since, _warn_clear_since
-    if not action or step >= len(STEP_NAMES):
-        _warn_action = None
-        _warn_since = None
-        if not _warning:
+    global _warning, _warning_key, _warn_clear_since
+    key = (step, action) if action else None
+    if _warning_key is not None:
+        if _warning_key[0] != step:
+            _clear_warning()
+        elif _warning_key == key:
             _warn_clear_since = None
             return
-        if _warn_clear_since is None:
-            _warn_clear_since = video_time
-        if video_time - _warn_clear_since >= WARN_SECONDS:
-            _warning = ""
-            _warn_clear_since = None
+        else:
+            if _warn_clear_since is None:
+                _warn_clear_since = video_time
+            if video_time - _warn_clear_since >= WARNING_CLEAR_SECONDS:
+                _clear_warning()
+    if key is None or step >= len(STEP_NAMES):
         return
+
+    window, count, gap = detect.alarm_settings()
+    hits = [stamp for stamp in _warning_hits.get(key, []) if video_time - window <= stamp <= video_time]
+    if not hits or video_time > hits[-1]:
+        hits.append(video_time)
+    _warning_hits[key] = hits
+    if len(hits) < count:
+        return
+    # Use distance along the video so replaying the same segment respects the interval.
+    if any(abs(video_time - stamp) < gap for stamp in _recorded_warning_times.get(key, [])):
+        return
+
+    message = f"{STEP_NAMES[step]}流程未完成，请勿进行{action}流程"
+    detect.record_alarm(PROCESS_ALARM_CODE, "流程检测", f"{message}（视频 {video_time:.1f} 秒）")
+    _warning = message
+    _warning_key = key
     _warn_clear_since = None
-    if action != _warn_action:
-        _warn_action = action
-        _warn_since = video_time
-        _warning = ""
-    if _warn_since is not None and video_time - _warn_since >= WARN_SECONDS:
-        _warning = f"{STEP_NAMES[step]}流程未完成，请勿进行{action}流程"
+    _recorded_warning_times.setdefault(key, []).append(video_time)
+    del _warning_hits[key]
 
 
 def _pick_gloves(found: list[dict]) -> list[dict]:
