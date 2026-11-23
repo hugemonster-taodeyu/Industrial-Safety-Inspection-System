@@ -14,7 +14,8 @@
           <div v-if="boxes.length" class="process-overlay">
             <div v-for="(box, index) in boxes" :key="index" class="process-box" :style="boxStyle(box)"></div>
           </div>
-          <p v-if="notice" class="process-notice">{{ notice }}</p>
+          <p v-if="warning" class="process-notice process-warning">{{ warning }}</p>
+          <p v-else-if="notice" class="process-notice">{{ notice }}</p>
         </div>
         <div class="camera-bar">
           <span class="time">{{ clock(time) }}</span>
@@ -89,6 +90,7 @@ const videoEl = ref(null);
 const running = ref(false);
 const error = ref("");
 const notice = ref("");
+const warning = ref("");
 const time = ref(0);
 const duration = ref(0);
 const slider = ref(0);
@@ -207,6 +209,9 @@ function noteProgress(nextSteps) {
 function applyStatus(status) {
   const nextSteps = status.steps || [];
   noteProgress(nextSteps);
+  const nextWarning = status.warning || "";
+  if (nextWarning) clearNotice();
+  warning.value = nextWarning;
   steps.value = nextSteps;
   current.value = status.current;
   const finished = status.current >= nextSteps.length;
@@ -227,6 +232,7 @@ async function onFile(event) {
   boxes.value = [];
   seenPassed = [];
   clearNotice();
+  warning.value = "";
   time.value = 0;
   duration.value = 0;
   slider.value = 0;
@@ -244,6 +250,7 @@ function clearVideo() {
   boxes.value = [];
   seenPassed = [];
   clearNotice();
+  warning.value = "";
   time.value = 0;
   duration.value = 0;
   slider.value = 0;

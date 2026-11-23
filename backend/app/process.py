@@ -18,7 +18,6 @@ LABELS = {
     "cable_connect_terminal": "高压接线端子",
     "ground_terminal": "地线端子",
     "connect_ground_terminal": "连接地线端子",
-    "stick_head": "导电棒尖端",
     "person": "人员",
     "glove": "绝缘手套",
     "rod": "导电棒",
@@ -27,9 +26,7 @@ LABELS = {
     "copper_wire": "铜线",
 }
 
-GLOVE_WEIGHTS = detect.MODELS / "glove.pt"
-ROD_WEIGHTS = detect.MODELS / "rod.pt"
-COPPER_WEIGHTS = detect.MODELS / "copper.pt"
+SCENE_WEIGHTS = detect.MODELS / "best(1).pt"
 PERSON_WEIGHTS = detect.MODELS / "yolo11n.pt"
 POSE_TASK = detect.MODELS / "pose_landmarker_heavy.task"
 ELBOW_REACH = 0.5
@@ -38,13 +35,22 @@ ROD_END_RATIO = 0.2
 ROD_HOLD_SECONDS = 0.3
 DISCHARGE_SECONDS = 5.0
 COPPER_SECONDS = 5.0
+WARN_SECONDS = 0.5
 CONNECTED_PHASES = ("connect_terminal_c", "connect_terminal_b", "connect_terminal_a")
+DETAIL_NAMES = {
+    "terminal",
+    "connect_terminal_a",
+    "connect_terminal_b",
+    "connect_terminal_c",
+    "cable_connect_terminal",
+    "ground_terminal",
+    "connect_ground_terminal",
+}
+COPPER_NAMES = {"connect", "disconnect", "copper_wire"}
+STEP_NAMES = ("启动", "检查变压器", "接线", "佩戴手套", "拿起导电棒", "放电", "铜线检测", "结束")
 
 _lock = threading.Lock()
-_detail_model = None
-_glove_model = None
-_rod_model = None
-_copper_model = None
+_scene_model = None
 _person_model = None
 _pose_landmarker = None
 _device = 0
@@ -71,6 +77,10 @@ _fixed_terminals = None
 _box_updated_at = None
 _last_time = None
 _front_since = None
+_warning = ""
+_warn_action = None
+_warn_since = None
+_warn_clear_since = None
 # MediaPipe Pose landmarks. Left and right are the person's own sides.
 _MP_SHOULDERS = (11, 12)
 _MP_ELBOWS = (13, 14)
@@ -86,6 +96,7 @@ def _fresh() -> None:
     global _sides, _parts, _start, _passed, _hands, _rod_since, _copper_since, _discharge_since, _discharge_box, _discharge_terminals, _discharge_updated_at
     global _end_since, _end_seen_at, _end_parts, _layout, _layout_seen, _stable_since
     global _fixed_box, _fixed_terminals, _box_updated_at, _last_time, _front_since
+    global _warning, _warn_action, _warn_since, _warn_clear_since
     _sides = {"left": False, "right": False, "front": False, "back": False}
     _parts = {name: False for name in WIRING_PARTS}
     _start = {"terminal": False, "ground_terminal": False}
@@ -108,6 +119,10 @@ def _fresh() -> None:
     _box_updated_at = None
     _last_time = None
     _front_since = None
+    _warning = ""
+    _warn_action = None
+    _warn_since = None
+    _warn_clear_since = None
 
 
 def _current() -> int:
@@ -132,62 +147,26 @@ def _status(boxes: list[dict] | None = None) -> dict:
             {"name": "结束", "passed": _passed[7], "parts": dict(_end_parts)},
         ],
         "boxes": boxes or [],
+        "warning": _warning,
     }
 
 
-def _ensure_glove() -> None:
-    global _glove_model
-    if _glove_model is not None:
+def _ensure_scene() -> None:
+    global _scene_model
+    if _scene_model is not None:
         return
     from ultralytics import YOLO
 
-    if not GLOVE_WEIGHTS.is_file():
-        raise FileNotFoundError(f"未找到手套模型 {GLOVE_WEIGHTS}")
-    _glove_model = YOLO(detect._model_file(GLOVE_WEIGHTS))
-
-
-def _ensure_copper() -> None:
-    global _copper_model
-    if _copper_model is not None:
-        return
-    from ultralytics import YOLO
-
-    if not COPPER_WEIGHTS.is_file():
-        raise FileNotFoundError(f"未找到铜线模型 {COPPER_WEIGHTS}")
-    _copper_model = YOLO(detect._model_file(COPPER_WEIGHTS))
-
-
-def _ensure_rod() -> None:
-    global _rod_model
-    if _rod_model is not None:
-        return
-    from ultralytics import YOLO
-
-    if not ROD_WEIGHTS.is_file():
-        raise FileNotFoundError(f"未找到导电棒模型 {ROD_WEIGHTS}")
-    _rod_model = YOLO(detect._model_file(ROD_WEIGHTS))
-
-
-def _ensure_detail() -> None:
-    global _detail_model
-    if _detail_model is not None:
-        return
-    from ultralytics import YOLO
-
-    path = detect.MODELS / "terminal.pt"
-    if not path.exists():
-        raise FileNotFoundError("未找到变压器细节模型 terminal.pt")
-    _detail_model = YOLO(detect._model_file(path))
+    if not SCENE_WEIGHTS.is_file():
+        raise FileNotFoundError(f"未找到合并检测模型 {SCENE_WEIGHTS}")
+    _scene_model = YOLO(detect._model_file(SCENE_WEIGHTS))
 
 
 def start_process() -> dict:
     global _running
     _ensure_person()
     _ensure_pose()
-    _ensure_detail()
-    _ensure_glove()
-    _ensure_rod()
-    _ensure_copper()
+    _ensure_scene()
     with _lock:
         _fresh()
         _running = True
@@ -205,21 +184,24 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
     if not _running:
         return _status()
     height, width = image.shape[:2]
-    details = _detail_boxes(image)
+    found = _scene_boxes(image)
+    details = [item for item in found if item["name"] in DETAIL_NAMES]
     boxes = [_public_box(item, width, height) for item in details]
     with _lock:
         step = _current() if _running else -1
-    poses = _poses(image) if step in (1, 3, 4, 5) else []
-    gloves = _detect_gloves(image) if step in (3, 4) else []
-    rod = _detect_rod(image) if step in (4, 5) else None
-    copper = _detect_copper(image) if step == 6 else []
-    for item in gloves:
-        boxes.append(_public_box(item, width, height))
-    if rod is not None:
+    poses = _poses(image) if step <= 5 else []
+    gloves = _pick_gloves(found) if step <= 4 else []
+    rod = _pick_rod(found) if step <= 5 else None
+    copper = [item for item in found if item["name"] in COPPER_NAMES] if step <= 6 else []
+    if step in (3, 4):
+        for item in gloves:
+            boxes.append(_public_box(item, width, height))
+    if step in (4, 5) and rod is not None:
         boxes.append(_public_box(_expand_rod(rod, width, height), width, height))
-    for item in copper:
-        boxes.append(_public_box(item, width, height))
-    if step != 5:
+    if step == 6:
+        for item in copper:
+            boxes.append(_public_box(item, width, height))
+    if step in (1, 3, 4):
         for pose in poses:
             boxes.append(_public_box({**pose, "name": "person"}, width, height))
     with _lock:
@@ -252,6 +234,8 @@ def analyze_process_frame(image, video_time: float = 0) -> dict:
             _observe_copper(copper, video_time)
         elif step == 7:
             _observe_finish(details, video_time)
+        step = _current()
+        _update_warning(step, _early_action(step, details, gloves, rod, poses, copper, width, height), video_time)
         return _status(boxes)
 
 
@@ -266,14 +250,16 @@ def _predict(model, image, **kwargs):
         return model.predict(image, device=_device, verbose=False, **kwargs)[0]
 
 
-def _detail_boxes(image) -> list[dict]:
-    result = _predict(_detail_model, image, imgsz=1280, conf=0.25)
+def _scene_boxes(image) -> list[dict]:
+    result = _predict(_scene_model, image, imgsz=1280, conf=0.25)
     names = result.names or {}
     boxes = []
     if result.boxes is None:
         return boxes
     for xyxy, cls, conf in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy(), result.boxes.conf.cpu().numpy()):
         name = str(names.get(int(cls), ""))
+        if name not in DETAIL_NAMES and name not in COPPER_NAMES and name not in {"glove", "rod"}:
+            continue
         x1, y1, x2, y2 = [float(value) for value in xyxy]
         boxes.append({"name": name, "conf": float(conf), "x1": x1, "y1": y1, "x2": x2, "y2": y2})
     return boxes
@@ -394,6 +380,7 @@ def _public_box(box: dict, width: int, height: int) -> dict:
 
 def _note_time(video_time: float) -> None:
     global _last_time, _layout, _layout_seen, _stable_since, _front_since, _rod_since, _copper_since, _discharge_since, _end_since, _end_seen_at, _end_parts
+    global _warning, _warn_action, _warn_since, _warn_clear_since
     if _last_time is not None and abs(video_time - _last_time) > 1.5:
         _layout = None
         _layout_seen = None
@@ -405,53 +392,81 @@ def _note_time(video_time: float) -> None:
         _end_since = None
         _end_seen_at = None
         _end_parts = {name: False for name in WIRING_PARTS}
+        _warning = ""
+        _warn_action = None
+        _warn_since = None
+        _warn_clear_since = None
     _last_time = video_time
 
 
-def _detect_gloves(image) -> list[dict]:
-    result = _predict(_glove_model, image, imgsz=1280, conf=0.25)
-    names = result.names or {}
-    boxes = []
-    if result.boxes is None:
-        return boxes
-    for xyxy, cls, conf in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy(), result.boxes.conf.cpu().numpy()):
-        if str(names.get(int(cls), "")) != "glove":
-            continue
-        x1, y1, x2, y2 = [float(value) for value in xyxy]
-        boxes.append({"name": "glove", "conf": float(conf), "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+def _both_hands_worn(gloves: list[dict], poses: list[dict]) -> bool:
+    by_person: dict[int, set[str]] = {}
+    for person, side in _worn_hands(gloves, poses):
+        by_person.setdefault(person, set()).add(side)
+    return any(sides >= {"left", "right"} for sides in by_person.values())
+
+
+def _early_discharge(details: list[dict], rod: dict | None, poses: list[dict], frame_width: int, frame_height: int) -> bool:
+    if rod is None:
+        return False
+    selected = _connected_region(details)
+    if selected is None:
+        return False
+    region, terminals = selected
+    area = _expand_rod(rod, frame_width, frame_height)
+    person = _nearest_person(area, poses)
+    return person is not None and _discharge_contact(area, person, region, terminals)
+
+
+def _early_action(step: int, details: list[dict], gloves: list[dict], rod: dict | None, poses: list[dict], copper: list[dict], frame_width: int, frame_height: int) -> str | None:
+    actions = []
+    if step < 2 and any(item["name"] in WIRING_PARTS for item in details):
+        actions.append("接线")
+    if step < 3 and _both_hands_worn(gloves, poses):
+        actions.append("佩戴手套")
+    if step < 4 and _holding_rod(gloves, rod, poses, frame_width, frame_height):
+        actions.append("拿起导电棒")
+    if step < 5 and _early_discharge(details, rod, poses, frame_width, frame_height):
+        actions.append("放电")
+    if step < 6 and any(item["name"] == "connect" for item in copper):
+        actions.append("铜线检测")
+    return actions[-1] if actions else None
+
+
+def _update_warning(step: int, action: str | None, video_time: float) -> None:
+    global _warning, _warn_action, _warn_since, _warn_clear_since
+    if not action or step >= len(STEP_NAMES):
+        _warn_action = None
+        _warn_since = None
+        if not _warning:
+            _warn_clear_since = None
+            return
+        if _warn_clear_since is None:
+            _warn_clear_since = video_time
+        if video_time - _warn_clear_since >= WARN_SECONDS:
+            _warning = ""
+            _warn_clear_since = None
+        return
+    _warn_clear_since = None
+    if action != _warn_action:
+        _warn_action = action
+        _warn_since = video_time
+        _warning = ""
+    if _warn_since is not None and video_time - _warn_since >= WARN_SECONDS:
+        _warning = f"{STEP_NAMES[step]}流程未完成，请勿进行{action}流程"
+
+
+def _pick_gloves(found: list[dict]) -> list[dict]:
+    boxes = [item for item in found if item["name"] == "glove"]
     boxes.sort(key=lambda item: item.get("conf", 0), reverse=True)
     return boxes[:2]
 
 
-def _detect_rod(image) -> dict | None:
-    result = _predict(_rod_model, image, imgsz=1280, conf=0.25)
-    names = result.names or {}
-    found = []
-    if result.boxes is None:
+def _pick_rod(found: list[dict]) -> dict | None:
+    rods = [item for item in found if item["name"] == "rod"]
+    if not rods:
         return None
-    for xyxy, cls, conf in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy(), result.boxes.conf.cpu().numpy()):
-        if str(names.get(int(cls), "")) != "rod":
-            continue
-        x1, y1, x2, y2 = [float(value) for value in xyxy]
-        found.append({"name": "rod", "conf": float(conf), "x1": x1, "y1": y1, "x2": x2, "y2": y2})
-    if not found:
-        return None
-    return max(found, key=lambda item: item["conf"])
-
-
-def _detect_copper(image) -> list[dict]:
-    result = _predict(_copper_model, image, imgsz=1280, conf=0.25)
-    names = result.names or {}
-    boxes = []
-    if result.boxes is None:
-        return boxes
-    for xyxy, cls, conf in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy(), result.boxes.conf.cpu().numpy()):
-        name = str(names.get(int(cls), ""))
-        if name not in {"connect", "disconnect", "copper_wire"}:
-            continue
-        x1, y1, x2, y2 = [float(value) for value in xyxy]
-        boxes.append({"name": name, "conf": float(conf), "x1": x1, "y1": y1, "x2": x2, "y2": y2})
-    return boxes
+    return max(rods, key=lambda item: item["conf"])
 
 
 def _observe_copper(items: list[dict], video_time: float) -> None:
